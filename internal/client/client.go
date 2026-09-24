@@ -103,7 +103,11 @@ func (c *Client) ListenAndServe(ctx context.Context, addr, dohAddr string) error
 }
 
 func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
-	wire, rcode := c.resolveQuery(r)
+	src := "udp"
+	if w.RemoteAddr() != nil && w.RemoteAddr().Network() == "tcp" {
+		src = "tcp"
+	}
+	wire, rcode := c.resolveQuery(src, r)
 	if wire == nil {
 		m := new(dns.Msg)
 		m.SetReply(r)
@@ -117,7 +121,7 @@ func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
 // resolveQuery answers a single-question DNS message and returns the
 // wire-format answer plus the RCODE to use when no answer was produced. It is
 // shared by the DNS (UDP/TCP) and DoH (HTTP) frontends.
-func (c *Client) resolveQuery(r *dns.Msg) ([]byte, int) {
+func (c *Client) resolveQuery(src string, r *dns.Msg) ([]byte, int) {
 	if len(r.Question) != 1 {
 		return nil, dns.RcodeFormatError
 	}
@@ -125,15 +129,18 @@ func (c *Client) resolveQuery(r *dns.Msg) ([]byte, int) {
 	q := r.Question[0]
 	name := strings.ToLower(dns.Fqdn(q.Name))
 	key := redisx.CacheKey(name, q.Qtype)
+	start := time.Now()
 
 	// 1. Local expiry-aware cache.
 	if wire, ok := c.localGet(key); ok {
+		log.Printf("client: query src=%s name=%s type=%d path=local took=%s", src, name, q.Qtype, time.Since(start))
 		return wire, dns.RcodeSuccess
 	}
 
 	// 2. Redis cache.
 	if b, err := c.rdb.Get(context.Background(), key).Bytes(); err == nil && len(b) > 0 {
 		c.localSet(key, b, time.Now().UnixNano())
+		log.Printf("client: query src=%s name=%s type=%d path=redis took=%s", src, name, q.Qtype, time.Since(start))
 		return b, dns.RcodeSuccess
 	}
 
@@ -142,11 +149,12 @@ func (c *Client) resolveQuery(r *dns.Msg) ([]byte, int) {
 		return c.resolve(context.Background(), name, q.Qtype)
 	})
 	if err != nil {
-		log.Printf("client: resolve %s/%d: %v", name, q.Qtype, err)
+		log.Printf("client: query src=%s name=%s type=%d path=upstream error=%v took=%s", src, name, q.Qtype, err, time.Since(start))
 		return nil, dns.RcodeServerFailure
 	}
 	resp := v.(proto.Response)
 	c.localSet(key, resp.Wire, resp.ResolvedAt)
+	log.Printf("client: query src=%s name=%s type=%d path=upstream rcode=%d took=%s", src, name, q.Qtype, resp.Rcode, time.Since(start))
 	return resp.Wire, dns.RcodeSuccess
 }
 
@@ -185,7 +193,7 @@ func (c *Client) dohHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wire, rcode := c.resolveQuery(msg)
+	wire, rcode := c.resolveQuery("doh", msg)
 	if wire == nil {
 		m := new(dns.Msg)
 		m.SetReply(msg)

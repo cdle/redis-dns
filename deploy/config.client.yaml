@@ -1,8 +1,11 @@
+# Client-side (LAN) deployment config — copy to /etc/redis-dns/config.client.yaml
+# and fill in the real Redis password.
 redis:
-  addr: "127.0.0.1:6379"
-  password: "ec25861d045708573c9bf6dd116abf0881d84a35"
+  addr: "127.0.0.1:6379"  # through the SSH tunnel to the server host
+  password: "CHANGE_ME"
   db: 0
 
 listen: "127.0.0.1:5353"
+doh_listen: "127.0.0.1:5354"  # optional DoH (RFC 8484) endpoint; empty disables
 local_ttl: 300
 block_time: 5

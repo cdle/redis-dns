@@ -25,6 +25,7 @@ func main() {
 	var cfgPath string
 	flag.StringVar(&cfgPath, "config", "", "path to YAML config file")
 	flag.Parse()
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -44,6 +45,9 @@ func main() {
 		time.Duration(cfg.BlockTime)*time.Second,
 		time.Duration(cfg.LocalTTL)*time.Second,
 	)
+	log.Printf("client: starting listen=%s doh=%s redis=%s block=%ds local_ttl=%ds",
+		cfg.Listen, cfg.DOHListen, cfg.Redis.Addr, cfg.BlockTime, cfg.LocalTTL)
+
 	if err := c.ListenAndServe(ctx, cfg.Listen, cfg.DOHListen); err != nil {
 		log.Fatalf("client: %v", err)
 	}

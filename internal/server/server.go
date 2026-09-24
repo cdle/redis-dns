@@ -135,22 +135,25 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 		return
 	}
 
+	start := time.Now()
 	resp := &proto.Response{ID: req.ID, Name: req.Name, Type: req.Type}
 
 	answer, err := s.res.Resolve(req.Name, req.Type)
 	if err != nil {
 		resp.Err = err.Error()
-		log.Printf("server: resolve %s/%d: %v", req.Name, req.Type, err)
+		log.Printf("server: resolve name=%s type=%d error=%v took=%s", req.Name, req.Type, err, time.Since(start))
 	} else {
 		wire, perr := answer.Pack()
 		if perr != nil {
 			resp.Err = perr.Error()
+			log.Printf("server: resolve name=%s type=%d pack_error=%v took=%s", req.Name, req.Type, perr, time.Since(start))
 		} else {
 			resp.Wire = wire
 			resp.Rcode = answer.Rcode
 			resp.ResolvedAt = time.Now().UnixNano()
-			s.cache(ctx, req.Name, req.Type, wire, answer)
+			ttl := s.cache(ctx, req.Name, req.Type, wire, answer)
 			s.publish(ctx, req.Name, req.Type, wire, answer, resp.ResolvedAt)
+			log.Printf("server: resolve name=%s type=%d rcode=%s answers=%d ttl=%s took=%s", req.Name, req.Type, dns.RcodeToString[answer.Rcode], len(answer.Answer), ttl, time.Since(start))
 		}
 	}
 
@@ -168,13 +171,13 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 // cache stores the answer wire verbatim with a TTL bounded by the record TTLs
 // (and by negTTL for negative answers), so the Redis cache never outlives the
 // real records it holds.
-func (s *Server) cache(ctx context.Context, name string, qtype uint16, wire []byte, answer *dns.Msg) {
+func (s *Server) cache(ctx context.Context, name string, qtype uint16, wire []byte, answer *dns.Msg) time.Duration {
 	ttl := s.cacheTTL
 	if answer.Rcode == dns.RcodeNameError {
 		ttl = s.negTTL
 	}
 	if ttl <= 0 {
-		return
+		return 0
 	}
 	if min := resolver.MinTTL(answer); min > 0 && time.Duration(min)*time.Second < ttl {
 		ttl = time.Duration(min) * time.Second
@@ -183,6 +186,7 @@ func (s *Server) cache(ctx context.Context, name string, qtype uint16, wire []by
 	if err := s.rdb.Set(ctx, key, wire, ttl).Err(); err != nil {
 		log.Printf("server: cache %s: %v", key, err)
 	}
+	return ttl
 }
 
 // publish broadcasts a freshly resolved answer on the updates channel.
