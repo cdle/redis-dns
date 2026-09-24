@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis-dns
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    # Host networking so redis binds 127.0.0.1 on the VPS loopback directly.
+    # Nothing is published: the LAN client reaches it via an SSH tunnel.
+    network_mode: host
+
+volumes:
+  redis-data:

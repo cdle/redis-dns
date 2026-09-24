@@ -1,0 +1,15 @@
+# Server-side (bwg) example — run: redis-dns-server -config config.server.yaml
+redis:
+  addr: "127.0.0.1:6379"
+  password: "CHANGE_ME"
+  db: 0
+
+upstream:
+  addr: "8.8.8.8:53"   # upstream recursive resolver (or 1.1.1.1)
+  network: "udp"
+  timeout: 5
+
+group: "dns"
+consumer: "resolver-1"
+cache_ttl: 300   # seconds; 0 disables Redis-side caching
+resp_ttl: 30     # seconds; how long a response entry is kept

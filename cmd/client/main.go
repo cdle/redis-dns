@@ -1,0 +1,64 @@
+// Command client runs a LAN-side DNS server that answers from local and Redis
+// caches first, and only falls back to an on-demand resolution request to the
+// server-side resolver when the answer is not cached.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/imdraw/redis-dns/internal/client"
+	"github.com/imdraw/redis-dns/internal/config"
+	"github.com/imdraw/redis-dns/internal/redisx"
+)
+
+func main() {
+	var cfgPath string
+	flag.StringVar(&cfgPath, "config", "", "path to YAML config file")
+	flag.Parse()
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+
+	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := ping(ctx, rdb); err != nil {
+		log.Fatalf("redis: %v", err)
+	}
+
+	c := client.New(
+		rdb,
+		time.Duration(cfg.BlockTime)*time.Second,
+		time.Duration(cfg.LocalTTL)*time.Second,
+	)
+	if err := c.ListenAndServe(ctx, cfg.Listen); err != nil {
+		log.Fatalf("client: %v", err)
+	}
+	log.Println("client: stopped")
+}
+
+func ping(ctx context.Context, rdb *redis.Client) error {
+	for i := 0; i < 10; i++ {
+		if err := rdb.Ping(ctx).Err(); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return errors.New("redis unreachable after 10 attempts")
+}
