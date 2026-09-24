@@ -1,6 +1,7 @@
 // Command server is the server-side resolver: it consumes DNS resolution
-// requests from a Redis stream, resolves them via an upstream resolver, caches
-// answers, and delivers responses back to clients.
+// requests from a Redis stream with a pool of workers, resolves them via an
+// upstream resolver, caches answers, delivers responses on a response stream,
+// and broadcasts freshly resolved answers on a pub/sub channel.
 package main
 
 import (
@@ -50,7 +51,10 @@ func main() {
 		cfg.Group,
 		cfg.Consumer,
 		time.Duration(cfg.CacheTTL)*time.Second,
-		time.Duration(cfg.RespTTL)*time.Second,
+		time.Duration(cfg.NegTTL)*time.Second,
+		cfg.RespMax,
+		cfg.Workers,
+		time.Duration(cfg.Prefetch.Interval)*time.Second,
 	)
 
 	if err := srv.Run(ctx); err != nil {

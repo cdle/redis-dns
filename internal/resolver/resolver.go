@@ -1,4 +1,5 @@
-// Package resolver performs upstream DNS resolution on behalf of the server.
+// Package resolver performs upstream DNS resolution on behalf of the server
+// and extracts cache TTLs from answers.
 package resolver
 
 import (
@@ -32,4 +33,29 @@ func (r *Resolver) Resolve(name string, qtype uint16) (*dns.Msg, error) {
 		return nil, fmt.Errorf("exchange: %w", err)
 	}
 	return resp, nil
+}
+
+// MinTTL returns the smallest cacheable TTL in the message, in seconds. It
+// scans answer records and, for negative responses, the SOA in the authority
+// section (RFC 2308: negative-caching TTL = min(SOA TTL, SOA.Minttl)).
+// A zero result means no TTL could be determined.
+func MinTTL(m *dns.Msg) uint32 {
+	var min uint32
+	consider := func(ttl uint32) {
+		if ttl > 0 && (min == 0 || ttl < min) {
+			min = ttl
+		}
+	}
+	for _, rr := range m.Answer {
+		consider(rr.Header().Ttl)
+	}
+	for _, rr := range m.Ns {
+		if soa, ok := rr.(*dns.SOA); ok {
+			consider(soa.Hdr.Ttl)
+			consider(soa.Minttl)
+		} else {
+			consider(rr.Header().Ttl)
+		}
+	}
+	return min
 }

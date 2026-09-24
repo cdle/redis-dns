@@ -16,14 +16,17 @@ type Config struct {
 
 	// Client settings.
 	Listen    string `yaml:"listen"`     // DNS listen address (client only)
-	LocalTTL  int    `yaml:"local_ttl"`  // local cache TTL, seconds
-	BlockTime int    `yaml:"block_time"` // BLPOP block timeout, seconds
+	LocalTTL  int    `yaml:"local_ttl"`  // fallback local-cache TTL when wire has no TTL, seconds
+	BlockTime int    `yaml:"block_time"` // wait timeout for a resolution response, seconds
 
 	// Server settings.
-	Group    string `yaml:"group"`
-	Consumer string `yaml:"consumer"`
-	CacheTTL int    `yaml:"cache_ttl"` // Redis cache TTL, seconds; 0 disables caching
-	RespTTL  int    `yaml:"resp_ttl"`  // response list entry TTL, seconds
+	Group    string   `yaml:"group"`
+	Consumer string   `yaml:"consumer"`
+	CacheTTL int      `yaml:"cache_ttl"` // Redis cache TTL ceiling, seconds; 0 disables caching
+	NegTTL   int      `yaml:"neg_ttl"`   // negative (NXDOMAIN) cache TTL ceiling, seconds; 0 disables
+	RespMax  int64    `yaml:"resp_max"`  // response stream MAXLEN cap
+	Workers  int      `yaml:"workers"`   // number of concurrent consumer workers; 0 = GOMAXPROCS
+	Prefetch Prefetch `yaml:"prefetch"`
 }
 
 // Redis holds the Redis connection parameters.
@@ -41,6 +44,13 @@ type Upstream struct {
 	Timeout int    `yaml:"timeout"` // seconds
 }
 
+// Prefetch configures scheduled refresh of fixed domains. Interval of 0
+// disables prefetching. Domains and their per-domain refresh interval live in
+// the Redis hash dns:hot:domains (field=fqdn, value=interval seconds).
+type Prefetch struct {
+	Interval int `yaml:"interval"` // seconds between refresh sweeps; 0 disables
+}
+
 // Default returns a configuration with sensible defaults.
 func Default() *Config {
 	return &Config{
@@ -54,9 +64,11 @@ func Default() *Config {
 		LocalTTL:  300,
 		BlockTime: 5,
 		Group:     "dns",
-		Consumer:  "resolver-1",
+		Consumer:  "resolver",
 		CacheTTL:  300,
-		RespTTL:   30,
+		NegTTL:    60,
+		RespMax:   1000,
+		Workers:   0,
 	}
 }
 
@@ -100,8 +112,11 @@ func finalize(cfg *Config) {
 	if cfg.BlockTime <= 0 {
 		cfg.BlockTime = 5
 	}
-	if cfg.RespTTL <= 0 {
-		cfg.RespTTL = 30
+	if cfg.NegTTL < 0 {
+		cfg.NegTTL = 0
+	}
+	if cfg.RespMax <= 0 {
+		cfg.RespMax = 1000
 	}
 	if cfg.Upstream.Timeout <= 0 {
 		cfg.Upstream.Timeout = 5
@@ -113,6 +128,6 @@ func finalize(cfg *Config) {
 		cfg.Group = "dns"
 	}
 	if cfg.Consumer == "" {
-		cfg.Consumer = "resolver-1"
+		cfg.Consumer = "resolver"
 	}
 }

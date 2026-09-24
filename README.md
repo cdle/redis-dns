@@ -15,11 +15,12 @@ This project replaces the "every device → DoH endpoint" fan-out with a
 two-tier design:
 
 1. A **server-side resolver** runs next to a Redis instance on a trusted host
-   (bwg). It is the only component that actually talks to upstream DNS
-   (`8.8.8.8`, `1.1.1.1`, …) over that host's own clean network path.
+   (bwg). It is the only component that actually talks to upstream DNS over
+   that host's own clean network path.
 2. A **LAN-side client** runs a normal DNS server (UDP+TCP port 53). It
-   answers from local and Redis caches first, and only sends a resolution
-   request to the server through Redis when the answer is not cached.
+   answers from a local, expiry-aware cache and the Redis cache first, and only
+   sends a resolution request to the server through Redis when the answer is
+   not cached.
 
 The LAN client never speaks DNS to the public internet, and the server never
 speaks DNS to the LAN. Redis is the only bridge, and it can travel over an SSH
@@ -28,27 +29,76 @@ tunnel so no plaintext Redis is ever exposed.
 ## Architecture
 
 ```
- LAN device ──UDP/TCP 53──> redis-dns-client (local cache)
-                                  │
-                                  │  Redis (over SSH tunnel)
-                                  ▼
-                     bwg: redis-dns-server ──> upstream DNS (8.8.8.8)
-                            ▲
-                            └──── Redis cache (dns:cache:*)
+ LAN device ──UDP/TCP 53──> redis-dns-client (local cache, real TTL)
+                                │
+                                │  Redis (over SSH tunnel)
+                                │   ├─ dns:req      (request stream)
+                                │   ├─ dns:resp     (response stream)
+                                │   ├─ dns:cache:*  (cached answers)
+                                │   └─ dns:updates  (pub/sub pushes)
+                                ▼
+                   bwg: redis-dns-server ──> upstream DNS
 ```
 
-### Request flow
+### Request–response (Redis Streams)
 
-1. Client receives a query; checks the in-memory cache, then the Redis cache.
-2. Cache miss: client publishes a request to the `dns:req` stream and blocks
-   on a per-request list key.
-3. Server consumes the stream, resolves via upstream, caches the wire-format
-   answer, and LPUSHes the response back.
-4. Client unpacks the answer and replies to the original query.
+The query path is a reliable, point-to-point request/response carried by two
+streams:
+
+1. Cache miss: the client publishes a `proto.Request` to the `dns:req` stream
+   and waits on a pending-request channel keyed by a random ID.
+2. The server's worker pool consumes `dns:req` through a consumer group (each
+   message delivered to exactly one worker), resolves via upstream, caches the
+   wire-format answer, and XADDs a `proto.Response` to the `dns:resp` stream
+   (capped with MAXLEN so stale responses cannot accumulate).
+3. The client's single dispatcher goroutine reads `dns:resp`, matches each
+   response to its pending request by ID, and delivers it. One blocking reader
+   serves all pending requests, so the connection pool is never exhausted by
+   per-request blocking reads.
+
+### Update push (Redis pub/sub)
+
+Whenever the server freshly resolves a name (on demand, or via prefetch), it
+also PUBLISHes the answer on the `dns:updates` channel. Every subscribing
+client warms its local cache from the push without issuing its own request.
+Losing a push is harmless: the client simply falls back to on-demand
+resolution, so the push path can be best-effort.
+
+### Caching
+
+- **Local cache** (client, in-memory): expiry derived from the real record TTLs
+  in the answer, not a fixed timeout. Falls back to `local_ttl` only when the
+  wire carries no usable TTL.
+- **Redis cache** (`dns:cache:<name>:<type>`): written by the server, TTL
+  bounded by the smallest answer-record TTL so it never outlives the records it
+  holds.
+- **Negative caching**: NXDOMAIN answers are cached too (RFC 2308: TTL =
+  min(SOA TTL, SOA.Minttl), capped at `neg_ttl`), so nonexistent names don't
+  trigger repeated upstream lookups.
+- **Coalescing**: concurrent identical queries are merged with singleflight,
+  so a burst of devices resolving the same cold name produces a single upstream
+  request.
+- **Versioning**: the local cache stores each answer's `resolved_at` and drops
+  any write older than the current entry, so a stale pushed answer can never
+  overwrite a fresher one.
+
+### Prefetch (hot domains)
+
+The server can refresh fixed domains on a schedule. Populate the Redis hash
+`dns:hot:domains` (field = fqdn, value = refresh interval in seconds), e.g.:
+
+```sh
+redis-cli HSET dns:hot:domains "google.com" 300 "www.youtube.com" 300
+```
+
+The prefetch loop resolves each domain when its interval elapses, caches the
+result, and broadcasts it, keeping clients warm without them querying.
 
 ## Why Redis
 
-- Redis Streams give a durable work queue with consumer-group semantics.
+- Redis Streams give a durable work queue with consumer-group semantics, and
+  pub/sub gives best-effort broadcast for cache warming — each channel matched
+  to its natural semantics (reliable point-to-point vs. fire-and-forget).
 - Wire-format DNS answers (the raw `dns.Msg` bytes) are stored verbatim, so
   the client replays exactly what upstream returned (rcode, TTLs, all
   sections) with no lossy re-encoding.

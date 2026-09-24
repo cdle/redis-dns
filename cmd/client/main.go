@@ -1,6 +1,7 @@
-// Command client runs a LAN-side DNS server that answers from local and Redis
-// caches first, and only falls back to an on-demand resolution request to the
-// server-side resolver when the answer is not cached.
+// Command client runs a LAN-side DNS server that answers from a local,
+// expiry-aware cache and a Redis cache first, and only falls back to an
+// on-demand resolution request to the server-side resolver when the answer is
+// not cached. It also subscribes to pushed updates to warm its local cache.
 package main
 
 import (

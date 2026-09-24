@@ -10,6 +10,15 @@ upstream:
   timeout: 5
 
 group: "dns"
-consumer: "resolver-1"
-cache_ttl: 300   # seconds; 0 disables Redis-side caching
-resp_ttl: 30     # seconds; how long a response entry is kept
+consumer: "resolver"
+workers: 4          # concurrent consumer workers; 0 = 1
+cache_ttl: 300      # Redis cache TTL ceiling, seconds; 0 disables caching
+neg_ttl: 60         # negative (NXDOMAIN) cache TTL ceiling, seconds; 0 disables
+resp_max: 1000      # response stream MAXLEN cap
+
+prefetch:
+  interval: 60      # seconds between hot-domain refresh sweeps; 0 disables
+
+# Fixed domains to refresh on schedule (A records): field=fqdn, value=interval
+# seconds. Populate the hash on Redis, e.g.:
+#   HSET dns:hot:domains "google.com" 300 "www.youtube.com" 300

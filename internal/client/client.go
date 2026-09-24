@@ -1,6 +1,8 @@
-// Package client runs a LAN-side DNS server that answers from local and Redis
-// caches first, and only falls back to an on-demand resolution request to the
-// server-side resolver when the answer is not cached.
+// Package client runs a LAN-side DNS server that answers from a local,
+// expiry-aware cache and a Redis cache first, and only falls back to an
+// on-demand resolution request when the answer is not cached. It also
+// subscribes to the server's updates channel to warm its local cache from
+// pushed answers.
 package client
 
 import (
@@ -17,25 +19,33 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/imdraw/redis-dns/internal/proto"
 	"github.com/imdraw/redis-dns/internal/redisx"
+	"github.com/imdraw/redis-dns/internal/resolver"
 )
 
-// Client is a DNS server that answers LAN queries, backed by a Redis cache and
-// an on-demand resolution channel to the server-side resolver.
+// Client is a DNS server that answers LAN queries, backed by a Redis cache, an
+// on-demand resolution channel, and pushed updates from the server.
 type Client struct {
 	rdb      *redis.Client
 	block    time.Duration
-	localTTL time.Duration
+	localTTL time.Duration // fallback TTL when the wire carries no usable TTL
+
+	sf singleflight.Group
 
 	mu    sync.RWMutex
 	local map[string]localEntry
+
+	wmu   sync.Mutex
+	waits map[string]chan proto.Response
 }
 
 type localEntry struct {
-	wire   []byte
-	expire time.Time
+	wire       []byte
+	expire     time.Time
+	resolvedAt int64
 }
 
 // New builds a Client. Non-positive timeouts are forced to sane defaults.
@@ -51,12 +61,16 @@ func New(rdb *redis.Client, block, localTTL time.Duration) *Client {
 		block:    block,
 		localTTL: localTTL,
 		local:    make(map[string]localEntry),
+		waits:    make(map[string]chan proto.Response),
 	}
 }
 
-// ListenAndServe runs the DNS server on addr for both UDP and TCP until ctx is
-// cancelled.
+// ListenAndServe runs the DNS server on addr for both UDP and TCP, plus the
+// response dispatcher and update subscriber, until ctx is cancelled.
 func (c *Client) ListenAndServe(ctx context.Context, addr string) error {
+	go c.runDispatcher(ctx)
+	go c.runSubscriber(ctx)
+
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", c.handle)
 
@@ -94,7 +108,7 @@ func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
 	name := strings.ToLower(dns.Fqdn(q.Name))
 	key := redisx.CacheKey(name, q.Qtype)
 
-	// 1. Local in-memory cache.
+	// 1. Local expiry-aware cache.
 	if wire, ok := c.localGet(key); ok {
 		c.reply(w, r, wire)
 		return
@@ -102,13 +116,15 @@ func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
 
 	// 2. Redis cache.
 	if b, err := c.rdb.Get(context.Background(), key).Bytes(); err == nil && len(b) > 0 {
-		c.localSet(key, b)
+		c.localSet(key, b, time.Now().UnixNano())
 		c.reply(w, r, b)
 		return
 	}
 
-	// 3. On-demand resolution via the server.
-	wire, err := c.resolve(context.Background(), name, q.Qtype)
+	// 3. On-demand resolution, coalesced across concurrent identical queries.
+	v, err, _ := c.sf.Do(key, func() (interface{}, error) {
+		return c.resolve(context.Background(), name, q.Qtype)
+	})
 	if err != nil {
 		log.Printf("client: resolve %s/%d: %v", name, q.Qtype, err)
 		m := new(dns.Msg)
@@ -117,8 +133,9 @@ func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
 		w.WriteMsg(m)
 		return
 	}
-	c.localSet(key, wire)
-	c.reply(w, r, wire)
+	resp := v.(proto.Response)
+	c.localSet(key, resp.Wire, resp.ResolvedAt)
+	c.reply(w, r, resp.Wire)
 }
 
 // reply unpacks a wire-format answer and echoes it to the requester.
@@ -135,42 +152,119 @@ func (c *Client) reply(w dns.ResponseWriter, r *dns.Msg, wire []byte) {
 	w.WriteMsg(m)
 }
 
-// resolve publishes a request to the stream and blocks on the per-request
-// response list.
-func (c *Client) resolve(ctx context.Context, name string, qtype uint16) ([]byte, error) {
+// resolve publishes a request to the stream and waits for the matching
+// response to arrive on the response stream (delivered via the dispatcher).
+func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.Response, error) {
 	req := proto.Request{ID: newID(), Name: name, Type: qtype}
 	payload, _ := json.Marshal(req)
+
+	ch := make(chan proto.Response, 1)
+	c.register(req.ID, ch)
+	defer c.unregister(req.ID)
 
 	if err := c.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: redisx.StreamRequests,
 		Values: map[string]interface{}{"data": string(payload)},
 	}).Err(); err != nil {
-		return nil, err
+		return proto.Response{}, err
 	}
 
-	key := redisx.RespKey(req.ID)
-	vals, err := c.rdb.BLPop(ctx, c.block, key).Result()
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return nil, errors.New("resolution timed out")
+	select {
+	case resp := <-ch:
+		if resp.Err != "" {
+			return resp, errors.New(resp.Err)
 		}
-		return nil, err
+		if len(resp.Wire) == 0 {
+			return resp, errors.New("empty answer")
+		}
+		return resp, nil
+	case <-time.After(c.block):
+		return proto.Response{}, errors.New("resolution timed out")
+	case <-ctx.Done():
+		return proto.Response{}, ctx.Err()
 	}
-	if len(vals) < 2 {
-		return nil, errors.New("empty response")
-	}
+}
 
-	var resp proto.Response
-	if err := json.Unmarshal([]byte(vals[1]), &resp); err != nil {
-		return nil, err
+// runDispatcher reads the response stream and routes each response to the
+// pending request waiting on it. A single blocking reader serves all pending
+// requests, so the Redis connection pool is not exhausted by per-request
+// blocking reads.
+func (c *Client) runDispatcher(ctx context.Context) {
+	lastID := "$"
+	for ctx.Err() == nil {
+		streams, err := c.rdb.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{redisx.StreamResponses, lastID},
+			Count:   100,
+			Block:   5 * time.Second,
+		}).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) || ctx.Err() != nil {
+				continue
+			}
+			log.Printf("client: xread responses: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		for _, st := range streams {
+			for _, msg := range st.Messages {
+				lastID = msg.ID
+				data, ok := msg.Values["data"].(string)
+				if !ok {
+					continue
+				}
+				var resp proto.Response
+				if err := json.Unmarshal([]byte(data), &resp); err != nil {
+					continue
+				}
+				c.dispatch(resp)
+			}
+		}
 	}
-	if resp.Err != "" {
-		return nil, errors.New(resp.Err)
+}
+
+// runSubscriber subscribes to the updates channel and warms the local cache
+// from every pushed answer. Missed pushes are harmless: the local cache simply
+// falls back to on-demand resolution.
+func (c *Client) runSubscriber(ctx context.Context) {
+	pubsub := c.rdb.Subscribe(ctx, redisx.ChannelUpdates)
+	defer pubsub.Close()
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			var upd proto.Update
+			if err := json.Unmarshal([]byte(msg.Payload), &upd); err != nil || len(upd.Wire) == 0 {
+				continue
+			}
+			c.localSet(redisx.CacheKey(upd.Name, upd.Type), upd.Wire, upd.ResolvedAt)
+		}
 	}
-	if len(resp.Wire) == 0 {
-		return nil, errors.New("empty answer")
+}
+
+func (c *Client) register(id string, ch chan proto.Response) {
+	c.wmu.Lock()
+	c.waits[id] = ch
+	c.wmu.Unlock()
+}
+
+func (c *Client) unregister(id string) {
+	c.wmu.Lock()
+	delete(c.waits, id)
+	c.wmu.Unlock()
+}
+
+func (c *Client) dispatch(resp proto.Response) {
+	c.wmu.Lock()
+	ch, ok := c.waits[resp.ID]
+	c.wmu.Unlock()
+	if ok {
+		ch <- resp
 	}
-	return resp.Wire, nil
 }
 
 func newID() string {
@@ -197,8 +291,21 @@ func (c *Client) localGet(key string) ([]byte, bool) {
 	return e.wire, true
 }
 
-func (c *Client) localSet(key string, wire []byte) {
+// localSet writes the local cache with a TTL derived from the real record TTLs
+// (falling back to localTTL), and version-orders competing writes so a stale
+// answer never overwrites a fresher one.
+func (c *Client) localSet(key string, wire []byte, resolvedAt int64) {
+	ttl := c.localTTL
+	if m := new(dns.Msg); m.Unpack(wire) == nil {
+		if min := resolver.MinTTL(m); min > 0 {
+			ttl = time.Duration(min) * time.Second
+		}
+	}
 	c.mu.Lock()
-	c.local[key] = localEntry{wire: wire, expire: time.Now().Add(c.localTTL)}
+	if e, ok := c.local[key]; ok && e.resolvedAt > resolvedAt {
+		c.mu.Unlock()
+		return
+	}
+	c.local[key] = localEntry{wire: wire, expire: time.Now().Add(ttl), resolvedAt: resolvedAt}
 	c.mu.Unlock()
 }
