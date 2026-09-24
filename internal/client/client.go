@@ -8,10 +8,13 @@ package client
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,9 +70,13 @@ func New(rdb *redis.Client, block, localTTL time.Duration) *Client {
 
 // ListenAndServe runs the DNS server on addr for both UDP and TCP, plus the
 // response dispatcher and update subscriber, until ctx is cancelled.
-func (c *Client) ListenAndServe(ctx context.Context, addr string) error {
+func (c *Client) ListenAndServe(ctx context.Context, addr, dohAddr string) error {
 	go c.runDispatcher(ctx)
 	go c.runSubscriber(ctx)
+
+	if dohAddr != "" {
+		go c.serveDoH(ctx, dohAddr)
+	}
 
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", c.handle)
@@ -96,12 +103,23 @@ func (c *Client) ListenAndServe(ctx context.Context, addr string) error {
 }
 
 func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
-	if len(r.Question) != 1 {
+	wire, rcode := c.resolveQuery(r)
+	if wire == nil {
 		m := new(dns.Msg)
 		m.SetReply(r)
-		m.Rcode = dns.RcodeFormatError
+		m.Rcode = rcode
 		w.WriteMsg(m)
 		return
+	}
+	c.reply(w, r, wire)
+}
+
+// resolveQuery answers a single-question DNS message and returns the
+// wire-format answer plus the RCODE to use when no answer was produced. It is
+// shared by the DNS (UDP/TCP) and DoH (HTTP) frontends.
+func (c *Client) resolveQuery(r *dns.Msg) ([]byte, int) {
+	if len(r.Question) != 1 {
+		return nil, dns.RcodeFormatError
 	}
 
 	q := r.Question[0]
@@ -110,15 +128,13 @@ func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
 
 	// 1. Local expiry-aware cache.
 	if wire, ok := c.localGet(key); ok {
-		c.reply(w, r, wire)
-		return
+		return wire, dns.RcodeSuccess
 	}
 
 	// 2. Redis cache.
 	if b, err := c.rdb.Get(context.Background(), key).Bytes(); err == nil && len(b) > 0 {
 		c.localSet(key, b, time.Now().UnixNano())
-		c.reply(w, r, b)
-		return
+		return b, dns.RcodeSuccess
 	}
 
 	// 3. On-demand resolution, coalesced across concurrent identical queries.
@@ -127,15 +143,72 @@ func (c *Client) handle(w dns.ResponseWriter, r *dns.Msg) {
 	})
 	if err != nil {
 		log.Printf("client: resolve %s/%d: %v", name, q.Qtype, err)
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Rcode = dns.RcodeServerFailure
-		w.WriteMsg(m)
-		return
+		return nil, dns.RcodeServerFailure
 	}
 	resp := v.(proto.Response)
 	c.localSet(key, resp.Wire, resp.ResolvedAt)
-	c.reply(w, r, resp.Wire)
+	return resp.Wire, dns.RcodeSuccess
+}
+
+// dohHandler serves DNS-over-HTTPS (RFC 8484) on /dns-query.
+func (c *Client) dohHandler(w http.ResponseWriter, r *http.Request) {
+	var msg *dns.Msg
+	switch r.Method {
+	case http.MethodGet:
+		b, err := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+		if err != nil {
+			http.Error(w, "invalid dns parameter", http.StatusBadRequest)
+			return
+		}
+		msg = new(dns.Msg)
+		if err := msg.Unpack(b); err != nil {
+			http.Error(w, "invalid dns message", http.StatusBadRequest)
+			return
+		}
+	case http.MethodPost:
+		if ct := r.Header.Get("Content-Type"); ct != "application/dns-message" {
+			http.Error(w, "unsupported content type", http.StatusUnsupportedMediaType)
+			return
+		}
+		b, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		if err != nil {
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		msg = new(dns.Msg)
+		if err := msg.Unpack(b); err != nil {
+			http.Error(w, "invalid dns message", http.StatusBadRequest)
+			return
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	wire, rcode := c.resolveQuery(msg)
+	if wire == nil {
+		m := new(dns.Msg)
+		m.SetReply(msg)
+		m.Rcode = rcode
+		wire, _ = m.Pack()
+	}
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.Write(wire)
+}
+
+// serveDoH runs the DoH HTTP frontend on addr until ctx is cancelled.
+func (c *Client) serveDoH(ctx context.Context, addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", c.dohHandler)
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+	log.Printf("client: serving DoH on http://%s/dns-query", addr)
+	if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
+		log.Printf("client: DoH server: %v", err)
+	}
 }
 
 // reply unpacks a wire-format answer and echoes it to the requester.

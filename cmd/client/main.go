@@ -44,7 +44,7 @@ func main() {
 		time.Duration(cfg.BlockTime)*time.Second,
 		time.Duration(cfg.LocalTTL)*time.Second,
 	)
-	if err := c.ListenAndServe(ctx, cfg.Listen); err != nil {
+	if err := c.ListenAndServe(ctx, cfg.Listen, cfg.DOHListen); err != nil {
 		log.Fatalf("client: %v", err)
 	}
 	log.Println("client: stopped")

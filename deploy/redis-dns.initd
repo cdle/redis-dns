@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance tunnel
+	procd_set_param command /usr/bin/dbclient -T -N -K 30 -I 0 -y -i /root/.ssh/id_dropbear -L 6379:127.0.0.1:6379 root@172.96.255.172
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance client
+	procd_set_param command /usr/local/bin/redis-dns-client -config /etc/redis-dns/config.client.yaml
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

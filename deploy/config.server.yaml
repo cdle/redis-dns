@@ -1,0 +1,19 @@
+redis:
+  addr: "127.0.0.1:6379"
+  password: "ec25861d045708573c9bf6dd116abf0881d84a35"
+  db: 0
+
+upstream:
+  addr: "8.8.8.8:53"
+  network: "udp"
+  timeout: 5
+
+group: "dns"
+consumer: "resolver"
+workers: 4
+cache_ttl: 300
+neg_ttl: 60
+resp_max: 1000
+
+prefetch:
+  interval: 60

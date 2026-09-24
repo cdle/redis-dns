@@ -1,0 +1,14 @@
+[Unit]
+Description=redis-dns server (bwg-side resolver)
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+ExecStart=/usr/local/bin/redis-dns-server -config /etc/redis-dns/config.server.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -5,5 +5,6 @@ redis:
   db: 0
 
 listen: "0.0.0.0:53"
+doh_listen: "127.0.0.1:5354"  # optional DoH (RFC 8484) endpoint; empty disables
 local_ttl: 300   # fallback local-cache TTL when the wire carries no usable TTL
 block_time: 5    # seconds; how long to wait for a resolution response

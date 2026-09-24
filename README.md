@@ -64,6 +64,22 @@ client warms its local cache from the push without issuing its own request.
 Losing a push is harmless: the client simply falls back to on-demand
 resolution, so the push path can be best-effort.
 
+### DoH frontend (optional)
+
+The client can also expose an RFC 8484 DoH endpoint (`POST`/`GET` `/dns-query`,
+`application/dns-message`) for tools that speak DoH instead of plain DNS.
+Enable it with `doh_listen` (e.g. `127.0.0.1:5354`); leave it empty to disable.
+
+```sh
+curl 'http://127.0.0.1:5354/dns-query?dns=<base64url-wire>'
+```
+
+The endpoint is plain HTTP by design (it is only reachable on the LAN or
+localhost). Mihomo (Clash.Meta) does not accept plain-`http://` DoH upstreams,
+so point its `proxy-server-nameserver` / `fallback` at the client's plain DNS
+port (`127.0.0.1:5353`) instead — or terminate TLS in front of the endpoint if
+you need `https://` DoH.
+
 ### Caching
 
 - **Local cache** (client, in-memory): expiry derived from the real record TTLs

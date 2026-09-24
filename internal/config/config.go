@@ -16,6 +16,7 @@ type Config struct {
 
 	// Client settings.
 	Listen    string `yaml:"listen"`     // DNS listen address (client only)
+	DOHListen string `yaml:"doh_listen"` // DoH HTTP listen address (client only); empty disables
 	LocalTTL  int    `yaml:"local_ttl"`  // fallback local-cache TTL when wire has no TTL, seconds
 	BlockTime int    `yaml:"block_time"` // wait timeout for a resolution response, seconds
 
@@ -61,6 +62,7 @@ func Default() *Config {
 			Timeout: 5,
 		},
 		Listen:    "0.0.0.0:53",
+		DOHListen: "127.0.0.1:5354",
 		LocalTTL:  300,
 		BlockTime: 5,
 		Group:     "dns",
