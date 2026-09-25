@@ -146,6 +146,21 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 	start := time.Now()
 	resp := &proto.Response{ID: req.ID, Name: req.Name, Type: req.Type}
 
+	// Cache-first: check the shared Redis cache locally (sub-ms on the same
+	// host) before hitting the upstream resolver. A cached hit skips the
+	// upstream round-trip entirely.
+	key := redisx.CacheKey(req.Name, req.Type)
+	if wire, err := s.rdb.Get(ctx, key).Bytes(); err == nil && len(wire) > 0 {
+		resp.Wire = wire
+		var m dns.Msg
+		if err := m.Unpack(wire); err == nil {
+			resp.Rcode = m.Rcode
+		}
+		resp.ResolvedAt = time.Now().UnixNano()
+		log.Printf("server: cache-hit name=%s type=%d took=%s", req.Name, req.Type, time.Since(start))
+		return
+	}
+
 	answer, err := s.res.Resolve(req.Name, req.Type)
 	if err != nil {
 		resp.Err = err.Error()
