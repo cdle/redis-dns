@@ -137,14 +137,11 @@ func (c *Client) resolveQuery(src string, r *dns.Msg) ([]byte, int) {
 		return wire, dns.RcodeSuccess
 	}
 
-	// 2. Redis cache.
-	if b, err := c.rdb.Get(context.Background(), key).Bytes(); err == nil && len(b) > 0 {
-		c.localSet(key, b, time.Now().UnixNano())
-		log.Printf("client: query src=%s name=%s type=%d path=redis took=%s", src, name, q.Qtype, time.Since(start))
-		return b, dns.RcodeSuccess
-	}
-
-	// 3. On-demand resolution, coalesced across concurrent identical queries.
+	// 2. On-demand resolution, coalesced across concurrent identical queries.
+	// NOTE: no synchronous Redis GET here — on a cold key it costs a full
+	// public-internet round trip (~1 RTT) just to learn "not cached". The
+	// server is cache-first anyway (it checks Redis before resolving), so a
+	// client-side GET only duplicates that check at 10x the latency.
 	v, err, _ := c.sf.Do(key, func() (interface{}, error) {
 		return c.resolve(context.Background(), name, q.Qtype)
 	})
@@ -249,10 +246,13 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 	// confirmation round-trip saves one full RTT on every cold query.
 	xaddErr := make(chan error, 1)
 	go func() {
-		xaddErr <- c.rdb.XAdd(ctx, &redis.XAddArgs{
+		started := time.Now()
+		err := c.rdb.XAdd(ctx, &redis.XAddArgs{
 			Stream: redisx.StreamRequests,
 			Values: map[string]interface{}{"data": string(payload)},
 		}).Err()
+		log.Printf("client: xadd-ack id=%s confirm_after_start=%.1fms", shortID(req.ID), float64(time.Since(started).Microseconds())/1000)
+		xaddErr <- err
 	}()
 
 	select {
@@ -331,6 +331,7 @@ func (c *Client) runDispatcher(ctx context.Context) {
 				if err := json.Unmarshal([]byte(data), &resp); err != nil {
 					continue
 				}
+				log.Printf("client: resp-recv id=%s", shortID(resp.ID))
 				c.dispatch(resp)
 			}
 		}
@@ -380,6 +381,14 @@ func (c *Client) dispatch(resp proto.Response) {
 	if ok {
 		ch <- resp
 	}
+}
+
+// shortID returns the first 8 hex chars of an ID for compact log pairing.
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func newID() string {
