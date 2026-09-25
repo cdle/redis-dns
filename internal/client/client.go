@@ -265,12 +265,26 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 		}
 		return resp, nil
 	case err := <-xaddErr:
-		// XADD failed before the request even landed; surface it unless the
-		// response already arrived (it may have won the race).
+		// The XADD confirmation only means the request landed in the stream —
+		// the response is still on its way. Only a real XADD failure aborts.
 		if err != nil {
 			return proto.Response{}, err
 		}
-		return proto.Response{}, errors.New("xadd confirmed without response")
+		// Confirmation received, keep waiting for the response below.
+		select {
+		case resp := <-ch:
+			if resp.Err != "" {
+				return resp, errors.New(resp.Err)
+			}
+			if len(resp.Wire) == 0 {
+				return resp, errors.New("empty answer")
+			}
+			return resp, nil
+		case <-time.After(c.block):
+			return proto.Response{}, errors.New("resolution timed out")
+		case <-ctx.Done():
+			return proto.Response{}, ctx.Err()
+		}
 	case <-time.After(c.block):
 		return proto.Response{}, errors.New("resolution timed out")
 	case <-ctx.Done():

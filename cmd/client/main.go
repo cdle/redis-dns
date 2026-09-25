@@ -32,7 +32,11 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB)
+	pool := cfg.Redis.PoolSize
+	if pool == 0 {
+		pool = 8
+	}
+	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB, pool)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

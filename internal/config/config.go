@@ -36,6 +36,7 @@ type Redis struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
+	PoolSize int    `yaml:"pool_size"` // connection pool size; 0 = small default (4)
 }
 
 // Upstream is the recursive resolver the server queries.

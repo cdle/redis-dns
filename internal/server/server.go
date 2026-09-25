@@ -114,9 +114,13 @@ func (s *Server) worker(ctx context.Context, consumer string) {
 
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
-				s.handle(ctx, msg)
-				// Ack regardless so malformed messages never loop forever.
-				s.rdb.XAck(ctx, redisx.StreamRequests, s.group, msg.ID)
+				// Process concurrently: a slow upstream resolve must not
+				// block the pickup of the other messages in this batch.
+				go func(m redis.XMessage) {
+					s.handle(ctx, m)
+					// Ack regardless so malformed messages never loop forever.
+					s.rdb.XAck(ctx, redisx.StreamRequests, s.group, m.ID)
+				}(msg)
 			}
 		}
 	}
@@ -158,6 +162,13 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 		}
 		resp.ResolvedAt = time.Now().UnixNano()
 		log.Printf("server: cache-hit name=%s type=%d took=%s", req.Name, req.Type, time.Since(start))
+		payload, _ := json.Marshal(resp)
+		s.rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: redisx.StreamResponses,
+			MaxLen: s.respMax,
+			Approx: true,
+			Values: map[string]interface{}{"data": string(payload)},
+		})
 		return
 	}
 
@@ -181,14 +192,19 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 	}
 
 	payload, _ := json.Marshal(resp)
-	if err := s.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: redisx.StreamResponses,
-		MaxLen: s.respMax,
-		Approx: true,
-		Values: map[string]interface{}{"data": string(payload)},
-	}).Err(); err != nil {
-		log.Printf("server: xadd response: %v", err)
-	}
+	// Fire-and-forget: the message is effective the instant it lands in the
+	// stream; waiting for the XADD confirmation round-trip only delays the
+	// worker from picking up the next request.
+	go func() {
+		if err := s.rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: redisx.StreamResponses,
+			MaxLen: s.respMax,
+			Approx: true,
+			Values: map[string]interface{}{"data": string(payload)},
+		}).Err(); err != nil {
+			log.Printf("server: xadd response: %v", err)
+		}
+	}()
 }
 
 // cache stores the answer wire verbatim with a TTL bounded by the record TTLs

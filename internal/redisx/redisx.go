@@ -42,14 +42,20 @@ func CacheKey(name string, qtype uint16) string {
 // New builds a Redis client from connection parameters. It maintains a
 // small pool of long-lived connections and pings them in the background
 // so dead connections are detected and replaced before a query hits them.
-func New(addr, username, password string, db int) *redis.Client {
+// poolSize controls how many connections the pool holds; servers running
+// concurrent handlers need a larger pool than clients (each blocking
+// XReadGroup/XRead consumes one connection for its whole duration).
+func New(addr, username, password string, db, poolSize int) *redis.Client {
+	if poolSize < 1 {
+		poolSize = 4
+	}
 	return redis.NewClient(&redis.Options{
 		Addr:         addr,
 		Username:     username,
 		Password:     password,
 		DB:           db,
-		PoolSize:     4,
-		MinIdleConns: 2,
+		PoolSize:     poolSize,
+		MinIdleConns: poolSize / 2,
 	})
 }
 
