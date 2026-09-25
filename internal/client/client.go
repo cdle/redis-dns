@@ -243,12 +243,17 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 	c.register(req.ID, ch)
 	defer c.unregister(req.ID)
 
-	if err := c.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: redisx.StreamRequests,
-		Values: map[string]interface{}{"data": string(payload)},
-	}).Err(); err != nil {
-		return proto.Response{}, err
-	}
+	// Fire the XADD and do not wait for its round-trip confirmation: the
+	// server only needs the message to land in the stream, and the blocking
+	// XRead below delivers the answer as soon as it is ready. Skipping the
+	// confirmation round-trip saves one full RTT on every cold query.
+	xaddErr := make(chan error, 1)
+	go func() {
+		xaddErr <- c.rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: redisx.StreamRequests,
+			Values: map[string]interface{}{"data": string(payload)},
+		}).Err()
+	}()
 
 	select {
 	case resp := <-ch:
@@ -259,6 +264,13 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 			return resp, errors.New("empty answer")
 		}
 		return resp, nil
+	case err := <-xaddErr:
+		// XADD failed before the request even landed; surface it unless the
+		// response already arrived (it may have won the race).
+		if err != nil {
+			return proto.Response{}, err
+		}
+		return proto.Response{}, errors.New("xadd confirmed without response")
 	case <-time.After(c.block):
 		return proto.Response{}, errors.New("resolution timed out")
 	case <-ctx.Done():

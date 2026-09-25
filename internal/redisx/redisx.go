@@ -3,7 +3,10 @@
 package redisx
 
 import (
+	"context"
+	"log"
 	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -36,12 +39,39 @@ func CacheKey(name string, qtype uint16) string {
 	return PrefixCache + name + ":" + strconv.Itoa(int(qtype))
 }
 
-// New builds a Redis client from connection parameters.
+// New builds a Redis client from connection parameters. It maintains a
+// small pool of long-lived connections and pings them in the background
+// so dead connections are detected and replaced before a query hits them.
 func New(addr, username, password string, db int) *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Username: username,
-		Password: password,
-		DB:       db,
+		Addr:         addr,
+		Username:     username,
+		Password:     password,
+		DB:           db,
+		PoolSize:     4,
+		MinIdleConns: 2,
 	})
+}
+
+// StartKeepalive pings the Redis client every interval on a background
+// goroutine until ctx is cancelled. This keeps idle NAT/firewall state
+// open and forces broken connections to be re-established ahead of
+// real queries. It returns immediately.
+func StartKeepalive(ctx context.Context, c *redis.Client, interval time.Duration) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				pingCtx, cancel := context.WithTimeout(ctx, interval)
+				if err := c.Ping(pingCtx).Err(); err != nil && ctx.Err() == nil {
+					log.Printf("redisx: keepalive ping: %v", err)
+				}
+				cancel()
+			}
+		}
+	}()
 }

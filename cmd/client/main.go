@@ -40,6 +40,10 @@ func main() {
 		log.Fatalf("redis: %v", err)
 	}
 
+	// Keep the pooled connections alive so idle NAT/firewall state does not
+	// silently drop them; this removes the first-query-after-idle spike.
+	redisx.StartKeepalive(ctx, rdb, 15*time.Second)
+
 	c := client.New(
 		rdb,
 		time.Duration(cfg.BlockTime)*time.Second,
