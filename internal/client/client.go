@@ -272,20 +272,28 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 // blocking reads.
 func (c *Client) runDispatcher(ctx context.Context) {
 	lastID := "$"
+	backoff := time.Second
 	for ctx.Err() == nil {
 		streams, err := c.rdb.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{redisx.StreamResponses, lastID},
 			Count:   100,
-			Block:   5 * time.Second,
+			Block:   0,
 		}).Result()
 		if err != nil {
-			if errors.Is(err, redis.Nil) || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, redis.Nil) {
 				continue
 			}
-			log.Printf("client: xread responses: %v", err)
-			time.Sleep(time.Second)
+			log.Printf("client: xread responses: %v (retry in %s)", err, backoff)
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
+		backoff = time.Second
 		for _, st := range streams {
 			for _, msg := range st.Messages {
 				lastID = msg.ID

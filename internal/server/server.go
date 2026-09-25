@@ -83,6 +83,7 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) worker(ctx context.Context, consumer string) {
+	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
@@ -93,16 +94,23 @@ func (s *Server) worker(ctx context.Context, consumer string) {
 			Consumer: consumer,
 			Streams:  []string{redisx.StreamRequests, ">"},
 			Count:    16,
-			Block:    2 * time.Second,
+			Block:    0,
 		}).Result()
 		if err != nil {
-			if errors.Is(err, redis.Nil) || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, redis.Nil) {
 				continue
 			}
-			log.Printf("server: xreadgroup: %v", err)
-			time.Sleep(time.Second)
+			log.Printf("server: xreadgroup: %v (retry in %s)", err, backoff)
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
+		backoff = time.Second
 
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
