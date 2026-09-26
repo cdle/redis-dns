@@ -32,11 +32,13 @@ type Config struct {
 
 // Redis holds the Redis connection parameters.
 type Redis struct {
-	Addr     string `yaml:"addr"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	DB       int    `yaml:"db"`
-	PoolSize int    `yaml:"pool_size"` // connection pool size; 0 = small default (4)
+	Addr       string `yaml:"addr"`
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	DB         int    `yaml:"db"`
+	PoolSize   int    `yaml:"pool_size"`   // connection pool size; 0 = small default (4)
+	TLS        bool   `yaml:"tls"`         // enable TLS (e.g. stunnel terminator in front of Redis)
+	ServerName string `yaml:"server_name"` // TLS SNI / certificate hostname; empty = derive from addr
 }
 
 // Upstream is the recursive resolver the server queries.

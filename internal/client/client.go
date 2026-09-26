@@ -358,6 +358,7 @@ func (c *Client) runSubscriber(ctx context.Context) {
 				continue
 			}
 			c.localSet(redisx.CacheKey(upd.Name, upd.Type), upd.Wire, upd.ResolvedAt)
+			log.Printf("client: warm name=%s type=%d", upd.Name, upd.Type)
 		}
 	}
 }

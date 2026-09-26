@@ -264,6 +264,12 @@ func (s *Server) prefetchSweep(ctx context.Context, next map[string]time.Time) {
 		log.Printf("server: prefetch hgetall: %v", err)
 		return
 	}
+	log.Printf("server: prefetch sweep: %d hot domains", len(domains))
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("server: prefetch sweep panic: %v", r)
+		}
+	}()
 	for fqdn, intervalStr := range domains {
 		interval, err := strconv.Atoi(strings.TrimSpace(intervalStr))
 		if err != nil || interval <= 0 {
@@ -286,5 +292,6 @@ func (s *Server) prefetchSweep(ctx context.Context, next map[string]time.Time) {
 		s.cache(ctx, name, dns.TypeA, wire, answer)
 		s.publish(ctx, name, dns.TypeA, wire, answer, time.Now().UnixNano())
 		next[name] = time.Now().Add(time.Duration(interval) * time.Second)
+		log.Printf("server: prefetch ok name=%s interval=%ds answers=%d", name, interval, len(answer.Answer))
 	}
 }

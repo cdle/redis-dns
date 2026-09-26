@@ -4,7 +4,9 @@ package redisx
 
 import (
 	"context"
+	"crypto/tls"
 	"log"
+	"net"
 	"strconv"
 	"time"
 
@@ -45,18 +47,30 @@ func CacheKey(name string, qtype uint16) string {
 // poolSize controls how many connections the pool holds; servers running
 // concurrent handlers need a larger pool than clients (each blocking
 // XReadGroup/XRead consumes one connection for its whole duration).
-func New(addr, username, password string, db, poolSize int) *redis.Client {
+// If serverName is non-empty and tls is true, connections are wrapped in
+// TLS with that SNI (for a terminator such as stunnel in front of Redis).
+func New(addr, username, password string, db, poolSize int, useTLS bool, serverName string) *redis.Client {
 	if poolSize < 1 {
 		poolSize = 4
 	}
-	return redis.NewClient(&redis.Options{
+	opts := &redis.Options{
 		Addr:         addr,
 		Username:     username,
 		Password:     password,
 		DB:           db,
 		PoolSize:     poolSize,
 		MinIdleConns: poolSize / 2,
-	})
+	}
+	if useTLS {
+		if serverName == "" {
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				serverName = h
+			}
+		}
+		tlsCfg := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+		opts.TLSConfig = tlsCfg
+	}
+	return redis.NewClient(opts)
 }
 
 // StartKeepalive pings the Redis client every interval on a background

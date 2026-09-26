@@ -37,7 +37,7 @@ func main() {
 	if pool == 0 {
 		pool = 32 // concurrent handlers need headroom beyond the blocking workers
 	}
-	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB, pool)
+	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB, pool, cfg.Redis.TLS, cfg.Redis.ServerName)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
