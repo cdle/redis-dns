@@ -41,6 +41,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	log.Printf("cfg redis debug: %+v", cfg.Redis)
 	if err := ping(ctx, rdb); err != nil {
 		log.Fatalf("redis: %v", err)
 	}
@@ -75,6 +76,8 @@ func ping(ctx context.Context, rdb *redis.Client) error {
 	for i := 0; i < 10; i++ {
 		if err := rdb.Ping(ctx).Err(); err == nil {
 			return nil
+		} else {
+			log.Printf("redis ping attempt %d failed: %v", i+1, err)
 		}
 		select {
 		case <-ctx.Done():
