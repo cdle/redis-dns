@@ -53,6 +53,11 @@ func main() {
 		time.Duration(cfg.BlockTime)*time.Second,
 		time.Duration(cfg.LocalTTL)*time.Second,
 	)
+
+	if cfg.Follow.API != "" {
+		go client.RunFollow(ctx, cfg.Follow, cfg.Redis.Password, cfg.Redis.DB, c)
+	}
+
 	log.Printf("client: starting listen=%s doh=%s redis=%s block=%ds local_ttl=%ds",
 		cfg.Listen, cfg.DOHListen, cfg.Redis.Addr, cfg.BlockTime, cfg.LocalTTL)
 

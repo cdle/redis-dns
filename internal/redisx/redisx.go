@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -87,10 +88,14 @@ func StartKeepalive(ctx context.Context, c *redis.Client, interval time.Duration
 				return
 			case <-t.C:
 				pingCtx, cancel := context.WithTimeout(ctx, interval)
-				if err := c.Ping(pingCtx).Err(); err != nil && ctx.Err() == nil {
+				err := c.Ping(pingCtx).Err()
+				cancel()
+				if err != nil && ctx.Err() == nil {
+					if strings.Contains(err.Error(), "client is closed") {
+						return // this pool was hot-swapped away; stop pinging it
+					}
 					log.Printf("redisx: keepalive ping: %v", err)
 				}
-				cancel()
 			}
 		}
 	}()

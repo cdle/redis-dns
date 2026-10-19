@@ -32,6 +32,7 @@ import (
 // Client is a DNS server that answers LAN queries, backed by a Redis cache, an
 // on-demand resolution channel, and pushed updates from the server.
 type Client struct {
+	rdbMu    sync.RWMutex
 	rdb      *redis.Client
 	block    time.Duration
 	localTTL time.Duration // fallback TTL when the wire carries no usable TTL
@@ -65,6 +66,29 @@ func New(rdb *redis.Client, block, localTTL time.Duration) *Client {
 		localTTL: localTTL,
 		local:    make(map[string]localEntry),
 		waits:    make(map[string]chan proto.Response),
+	}
+}
+
+// rdbGet returns the active redis client (hot-swappable).
+func (c *Client) rdbGet() *redis.Client {
+	c.rdbMu.RLock()
+	defer c.rdbMu.RUnlock()
+	return c.rdb
+}
+
+// SwapRedis hot-swaps the redis backend and clears the local cache.
+// The old pool is closed after a short grace period so in-flight
+// operations finish; new traffic uses the new backend immediately.
+func (c *Client) SwapRedis(rdb *redis.Client) {
+	c.rdbMu.Lock()
+	old := c.rdb
+	c.rdb = rdb
+	c.mu.Lock()
+	c.local = make(map[string]localEntry)
+	c.mu.Unlock()
+	c.rdbMu.Unlock()
+	if old != nil {
+		time.AfterFunc(time.Second, func() { old.Close() })
 	}
 }
 
@@ -247,7 +271,7 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 	xaddErr := make(chan error, 1)
 	go func() {
 		started := time.Now()
-		err := c.rdb.XAdd(ctx, &redis.XAddArgs{
+		err := c.rdbGet().XAdd(ctx, &redis.XAddArgs{
 			Stream: redisx.StreamRequests,
 			Values: map[string]interface{}{"data": string(payload)},
 		}).Err()
@@ -300,7 +324,7 @@ func (c *Client) runDispatcher(ctx context.Context) {
 	lastID := "$"
 	backoff := time.Second
 	for ctx.Err() == nil {
-		streams, err := c.rdb.XRead(ctx, &redis.XReadArgs{
+		streams, err := c.rdbGet().XRead(ctx, &redis.XReadArgs{
 			Streams: []string{redisx.StreamResponses, lastID},
 			Count:   100,
 			Block:   0,
@@ -342,24 +366,29 @@ func (c *Client) runDispatcher(ctx context.Context) {
 // from every pushed answer. Missed pushes are harmless: the local cache simply
 // falls back to on-demand resolution.
 func (c *Client) runSubscriber(ctx context.Context) {
-	pubsub := c.rdb.Subscribe(ctx, redisx.ChannelUpdates)
-	defer pubsub.Close()
-	ch := pubsub.Channel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg, ok := <-ch:
-			if !ok {
-				return
+	for ctx.Err() == nil {
+		func() {
+			pubsub := c.rdbGet().Subscribe(ctx, redisx.ChannelUpdates)
+			defer pubsub.Close()
+			ch := pubsub.Channel()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case msg, ok := <-ch:
+					if !ok {
+						return // connection lost; reconnect with current backend
+					}
+					var upd proto.Update
+					if err := json.Unmarshal([]byte(msg.Payload), &upd); err != nil || len(upd.Wire) == 0 {
+						continue
+					}
+					c.localSet(redisx.CacheKey(upd.Name, upd.Type), upd.Wire, upd.ResolvedAt)
+					log.Printf("client: warm name=%s type=%d", upd.Name, upd.Type)
+				}
 			}
-			var upd proto.Update
-			if err := json.Unmarshal([]byte(msg.Payload), &upd); err != nil || len(upd.Wire) == 0 {
-				continue
-			}
-			c.localSet(redisx.CacheKey(upd.Name, upd.Type), upd.Wire, upd.ResolvedAt)
-			log.Printf("client: warm name=%s type=%d", upd.Name, upd.Type)
-		}
+		}()
+		time.Sleep(time.Second) // reconnect (possibly to a hot-swapped backend)
 	}
 }
 

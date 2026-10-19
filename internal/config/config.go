@@ -28,6 +28,9 @@ type Config struct {
 	RespMax  int64    `yaml:"resp_max"`  // response stream MAXLEN cap
 	Workers  int      `yaml:"workers"`   // number of concurrent consumer workers; 0 = GOMAXPROCS
 	Prefetch Prefetch `yaml:"prefetch"`
+
+	// Client settings.
+	Follow Follow `yaml:"follow"` // empty API disables node following
 }
 
 // Redis holds the Redis connection parameters.
@@ -46,6 +49,23 @@ type Upstream struct {
 	Addr    string `yaml:"addr"`
 	Network string `yaml:"network"` // udp, tcp, tcp-tls
 	Timeout int    `yaml:"timeout"` // seconds
+}
+
+// Follow is the optional proxy-node-following configuration (client only):
+// watch a mihomo policy group and keep the redis backend pinned to the node
+// that is actually in use.
+type Follow struct {
+	API      string                   `yaml:"api"`      // mihomo external-controller URL
+	Token    string                   `yaml:"token"`    // bearer token
+	Group    string                   `yaml:"group"`    // policy group to watch
+	Interval int                      `yaml:"interval"` // seconds between polls
+	Backends map[string]FollowBackend `yaml:"backends"` // node name -> redis-dns backend
+}
+
+// FollowBackend points at the redis-dns server of one proxy node.
+type FollowBackend struct {
+	Addr string `yaml:"addr"`
+	SNI  string `yaml:"sni"`
 }
 
 // Prefetch configures scheduled refresh of fixed domains. Interval of 0
