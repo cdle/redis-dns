@@ -104,6 +104,15 @@ func (s *Server) worker(ctx context.Context, consumer string) {
 				continue
 			}
 			log.Printf("server: xreadgroup: %v (retry in %s)", err, backoff)
+			if strings.Contains(err.Error(), "NOGROUP") {
+				// Consumer group vanished (e.g. redis restarted without
+				// persistence): recreate it instead of spinning forever.
+				if gerr := s.ensureGroup(ctx); gerr != nil {
+					log.Printf("server: ensureGroup after NOGROUP: %v", gerr)
+				} else {
+					log.Printf("server: group recreated after NOGROUP")
+				}
+			}
 			time.Sleep(backoff)
 			if backoff < 5*time.Second {
 				backoff *= 2
