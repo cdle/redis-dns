@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -28,6 +29,7 @@ type Config struct {
 	RespMax  int64    `yaml:"resp_max"`  // response stream MAXLEN cap
 	Workers  int      `yaml:"workers"`   // number of concurrent consumer workers; 0 = GOMAXPROCS
 	Prefetch Prefetch `yaml:"prefetch"`
+	Race     Race     `yaml:"race"`
 
 	// Client settings.
 	Follow Follow `yaml:"follow"` // empty API disables node following
@@ -73,6 +75,35 @@ type FollowBackend struct {
 // the Redis hash dns:hot:domains (field=fqdn, value=interval seconds).
 type Prefetch struct {
 	Interval int `yaml:"interval"` // seconds between refresh sweeps; 0 disables
+}
+
+// Race configures server-side answer racing (see internal/resolver): when an
+// upstream answer carries several IPs, the server probes them concurrently
+// and narrows the answer to the fastest-responding one. Racing is enabled
+// unless the config explicitly disables it.
+type Race struct {
+	Enabled *bool `yaml:"enabled"`    // nil = enabled; set false to disable
+	Ports   []int `yaml:"ports"`      // probe ports in priority order; empty = [443 80]
+	Timeout int   `yaml:"timeout_ms"` // overall probe budget, ms; <=0 = 1000
+}
+
+// IsEnabled reports whether answer racing is on.
+func (r Race) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
+
+// PortList returns the probe ports, defaulting to [443 80].
+func (r Race) PortList() []int {
+	if len(r.Ports) > 0 {
+		return r.Ports
+	}
+	return []int{443, 80}
+}
+
+// TimeoutDur returns the probe budget, defaulting to one second.
+func (r Race) TimeoutDur() time.Duration {
+	if r.Timeout > 0 {
+		return time.Duration(r.Timeout) * time.Millisecond
+	}
+	return time.Second
 }
 
 // Default returns a configuration with sensible defaults.

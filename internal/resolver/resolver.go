@@ -14,6 +14,7 @@ type Resolver struct {
 	upstream string
 	network  string
 	timeout  time.Duration
+	race     *raceConfig // nil = answer racing disabled
 }
 
 // New builds a Resolver.
@@ -31,6 +32,9 @@ func (r *Resolver) Resolve(name string, qtype uint16) (*dns.Msg, error) {
 	resp, _, err := c.Exchange(m, r.upstream)
 	if err != nil {
 		return nil, fmt.Errorf("exchange: %w", err)
+	}
+	if r.race != nil {
+		resp = r.applyRace(resp, qtype)
 	}
 	return resp, nil
 }

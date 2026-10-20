@@ -51,6 +51,9 @@ func main() {
 		cfg.Upstream.Network,
 		time.Duration(cfg.Upstream.Timeout)*time.Second,
 	)
+	if cfg.Race.IsEnabled() {
+		res.EnableRace(cfg.Race.PortList(), cfg.Race.TimeoutDur())
+	}
 	srv := server.New(
 		rdb,
 		res,
@@ -63,8 +66,9 @@ func main() {
 		time.Duration(cfg.Prefetch.Interval)*time.Second,
 	)
 
-	log.Printf("server: starting upstream=%s/%s timeout=%ds workers=%d cache_ttl=%ds neg_ttl=%ds resp_max=%d prefetch=%ds",
-		cfg.Upstream.Addr, cfg.Upstream.Network, cfg.Upstream.Timeout, cfg.Workers, cfg.CacheTTL, cfg.NegTTL, cfg.RespMax, cfg.Prefetch.Interval)
+	log.Printf("server: starting upstream=%s/%s timeout=%ds workers=%d cache_ttl=%ds neg_ttl=%ds resp_max=%d prefetch=%ds race=%v ports=%v budget=%s",
+		cfg.Upstream.Addr, cfg.Upstream.Network, cfg.Upstream.Timeout, cfg.Workers, cfg.CacheTTL, cfg.NegTTL, cfg.RespMax, cfg.Prefetch.Interval,
+		cfg.Race.IsEnabled(), cfg.Race.PortList(), cfg.Race.TimeoutDur())
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server: %v", err)

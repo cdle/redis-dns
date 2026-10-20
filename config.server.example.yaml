@@ -19,6 +19,11 @@ resp_max: 1000      # response stream MAXLEN cap
 prefetch:
   interval: 60      # seconds between hot-domain refresh sweeps; 0 disables
 
+race:               # answer racing: probe multi-IP answers concurrently and
+  enabled: true     # keep only the fastest IP (enabled unless set false)
+  ports: [443, 80]  # probe ports in priority order
+  timeout_ms: 1000  # overall probe budget; no answer in time = keep upstream answer
+
 # Fixed domains to refresh on schedule (A records): field=fqdn, value=interval
 # seconds. Populate the hash on Redis, e.g.:
 #   HSET dns:hot:domains "google.com" 300 "www.youtube.com" 300
