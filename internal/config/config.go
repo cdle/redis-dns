@@ -70,11 +70,32 @@ type FollowBackend struct {
 	SNI  string `yaml:"sni"`
 }
 
-// Prefetch configures scheduled refresh of fixed domains. Interval of 0
-// disables prefetching. Domains and their per-domain refresh interval live in
-// the Redis hash dns:hot:domains (field=fqdn, value=interval seconds).
+// Prefetch configures scheduled refresh of hot domains. Interval of 0
+// disables prefetching. Two sources feed a sweep: the fixed domains in
+// the Redis hash dns:hot:domains (field=fqdn, value=interval seconds),
+// and the TopN most-queried names from the query-count ranking
+// (dns:count:q), whose scores decay with a half-life of DecayHours so
+// the ranking tracks recent demand.
 type Prefetch struct {
-	Interval int `yaml:"interval"` // seconds between refresh sweeps; 0 disables
+	Interval   int `yaml:"interval"`    // seconds between refresh sweeps; 0 disables
+	TopN       int `yaml:"topn"`        // top-queried names kept warm per sweep; <=0 = 50
+	DecayHours int `yaml:"decay_hours"` // query-count half-life, hours; <=0 = 24
+}
+
+// TopNN returns the dynamic-prefetch breadth, defaulting to 50.
+func (p Prefetch) TopNN() int {
+	if p.TopN > 0 {
+		return p.TopN
+	}
+	return 50
+}
+
+// DecayDur returns the query-count half-life, defaulting to 24h.
+func (p Prefetch) DecayDur() time.Duration {
+	if p.DecayHours > 0 {
+		return time.Duration(p.DecayHours) * time.Hour
+	}
+	return 24 * time.Hour
 }
 
 // Race configures server-side answer racing (see internal/resolver): when an

@@ -36,10 +36,15 @@ type Server struct {
 	respMax  int64
 	workers  int
 	prefetch time.Duration
+	topN     int                                               // dynamic prefetch breadth (top-queried names)
+	halfLife time.Duration                                     // query-count decay half-life
+	rank     rankStore                                         // query-count ranking storage
+	countCh  chan string                                       // query-count queue feeding runCounter
+	resolve  func(name string, qtype uint16) (*dns.Msg, error) // prefetch resolve path
 }
 
 // New builds a Server. Non-positive respMax is forced to 1000.
-func New(rdb *redis.Client, res *resolver.Resolver, group, consumer string, cacheTTL, negTTL time.Duration, respMax int64, workers int, prefetch time.Duration) *Server {
+func New(rdb *redis.Client, res *resolver.Resolver, group, consumer string, cacheTTL, negTTL time.Duration, respMax int64, workers int, prefetch time.Duration, topN int, halfLife time.Duration) *Server {
 	if respMax <= 0 {
 		respMax = 1000
 	}
@@ -56,6 +61,11 @@ func New(rdb *redis.Client, res *resolver.Resolver, group, consumer string, cach
 		respMax:  respMax,
 		workers:  workers,
 		prefetch: prefetch,
+		topN:     topN,
+		halfLife: halfLife,
+		rank:     &redisRankStore{rdb: rdb},
+		countCh:  make(chan string, countQueueSize),
+		resolve:  res.Resolve,
 	}
 }
 
@@ -66,6 +76,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	log.Printf("server: consuming stream %q as group %q with %d workers", redisx.StreamRequests, s.group, s.workers)
 
+	go s.runCounter(ctx)
 	if s.prefetch > 0 {
 		go s.runPrefetch(ctx)
 	}
@@ -155,6 +166,8 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 		log.Printf("server: malformed request: %v", err)
 		return
 	}
+
+	s.countQuery(ctx, req.Name, req.Type)
 
 	start := time.Now()
 	resp := &proto.Response{ID: req.ID, Name: req.Name, Type: req.Type}
@@ -289,7 +302,7 @@ func (s *Server) prefetchSweep(ctx context.Context, next map[string]time.Time) {
 			continue
 		}
 
-		answer, err := s.res.Resolve(name, dns.TypeA)
+		answer, err := s.resolve(name, dns.TypeA)
 		if err != nil {
 			log.Printf("server: prefetch %s: %v", name, err)
 			continue
@@ -302,5 +315,49 @@ func (s *Server) prefetchSweep(ctx context.Context, next map[string]time.Time) {
 		s.publish(ctx, name, dns.TypeA, wire, answer, time.Now().UnixNano())
 		next[name] = time.Now().Add(time.Duration(interval) * time.Second)
 		log.Printf("server: prefetch ok name=%s interval=%ds answers=%d", name, interval, len(answer.Answer))
+	}
+
+	s.prefetchDynamic(ctx, next)
+	if s.rank != nil && s.halfLife > 0 {
+		if err := s.rank.Decay(ctx, decayFactor(s.halfLife, s.prefetch)); err != nil {
+			log.Printf("server: prefetch decay: %v", err)
+		}
+	}
+}
+
+// prefetchDynamic refreshes the top-queried names from the ranking
+// set: whatever clients actually ask for stays warm, without anyone
+// maintaining a fixed list. Entries are rescheduled by answer TTL
+// (see prefetchNextDelay), so a hot name never lapses while ranked.
+func (s *Server) prefetchDynamic(ctx context.Context, next map[string]time.Time) {
+	if s.topN <= 0 || s.rank == nil {
+		return
+	}
+	top, err := s.rank.Top(ctx, s.topN, minPrefetchScore)
+	if err != nil {
+		log.Printf("server: prefetch top: %v", err)
+		return
+	}
+	refreshed := 0
+	for _, m := range dueDynamic(top, next, time.Now()) {
+		name, qtype, _ := parseMember(m.Member)
+		key := "dyn|" + m.Member
+		answer, err := s.resolve(name, qtype)
+		if err != nil {
+			log.Printf("server: prefetch dyn %s type=%d: %v", name, qtype, err)
+			next[key] = time.Now().Add(s.prefetch)
+			continue
+		}
+		wire, err := answer.Pack()
+		if err != nil {
+			continue
+		}
+		ttl := s.cache(ctx, name, qtype, wire, answer)
+		s.publish(ctx, name, qtype, wire, answer, time.Now().UnixNano())
+		next[key] = time.Now().Add(prefetchNextDelay(ttl, s.prefetch))
+		refreshed++
+	}
+	if refreshed > 0 {
+		log.Printf("server: prefetch dynamic: refreshed %d of top %d", refreshed, len(top))
 	}
 }

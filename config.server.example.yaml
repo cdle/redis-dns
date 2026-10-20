@@ -18,6 +18,8 @@ resp_max: 1000      # response stream MAXLEN cap
 
 prefetch:
   interval: 60      # seconds between hot-domain refresh sweeps; 0 disables
+  topn: 50          # also keep this many top-queried names warm (from dns:count:q)
+  decay_hours: 24   # query-count half-life: rankings track recent demand
 
 race:               # answer racing: probe multi-IP answers concurrently and
   enabled: true     # keep only the fastest IP (enabled unless set false)

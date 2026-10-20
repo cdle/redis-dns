@@ -35,6 +35,12 @@ const (
 	// HashHotDomains holds fixed domains the server should refresh on a
 	// schedule: field = fqdn, value = refresh interval in seconds.
 	HashHotDomains = "dns:hot:domains"
+
+	// SetQueryCounts is the sorted set ranking queried names by
+	// demand: member = <fqdn>|<type string>, score = decayed query
+	// count. The server increments it per client request and keeps
+	// the top members prefetched (see internal/server).
+	SetQueryCounts = "dns:count:q"
 )
 
 // CacheKey returns the Redis key holding a cached DNS answer.

@@ -66,12 +66,14 @@ func main() {
 		cfg.RespMax,
 		cfg.Workers,
 		time.Duration(cfg.Prefetch.Interval)*time.Second,
+		cfg.Prefetch.TopNN(),
+		cfg.Prefetch.DecayDur(),
 	)
 
-	log.Printf("server: starting upstream=%s/%s timeout=%ds workers=%d cache_ttl=%ds neg_ttl=%ds resp_max=%d prefetch=%ds race=%v ports=%v budget=%s tcp_deadline=%s icmp=%v pref_ttl=%s pref_neg_ttl=%s recheck=%d/%s",
+	log.Printf("server: starting upstream=%s/%s timeout=%ds workers=%d cache_ttl=%ds neg_ttl=%ds resp_max=%d prefetch=%ds race=%v ports=%v budget=%s tcp_deadline=%s icmp=%v pref_ttl=%s pref_neg_ttl=%s recheck=%d/%s topn=%d count_halflife=%s",
 		cfg.Upstream.Addr, cfg.Upstream.Network, cfg.Upstream.Timeout, cfg.Workers, cfg.CacheTTL, cfg.NegTTL, cfg.RespMax, cfg.Prefetch.Interval,
 		cfg.Race.IsEnabled(), cfg.Race.PortList(), cfg.Race.TimeoutDur(), cfg.Race.TCPDeadlineDur(), cfg.Race.ICMPEnabled(),
-		cfg.Race.PrefTTLDur(), cfg.Race.PrefNegTTLDur(), cfg.Race.RecheckHitsN(), cfg.Race.RecheckAgeDur())
+		cfg.Race.PrefTTLDur(), cfg.Race.PrefNegTTLDur(), cfg.Race.RecheckHitsN(), cfg.Race.RecheckAgeDur(), cfg.Prefetch.TopNN(), cfg.Prefetch.DecayDur())
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server: %v", err)
