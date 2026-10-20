@@ -15,6 +15,7 @@ type Resolver struct {
 	network  string
 	timeout  time.Duration
 	race     *raceConfig // nil = answer racing disabled
+	pref     *prefState  // nil = preferred-IP cache disabled
 }
 
 // New builds a Resolver.

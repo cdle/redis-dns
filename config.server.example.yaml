@@ -23,6 +23,12 @@ race:               # answer racing: probe multi-IP answers concurrently and
   enabled: true     # keep only the fastest IP (enabled unless set false)
   ports: [443, 80]  # probe ports in priority order
   timeout_ms: 1000  # overall probe budget; no answer in time = keep upstream answer
+  tcp_deadline_ms: 200 # TCP gets this long to answer before ICMP results take over
+  icmp: true        # also probe with ICMP echo (the only signal for non-web hosts)
+  pref_ttl: 86400   # remember each race winner this long, seconds
+  pref_neg_ttl: 600 # remember "nobody answered" this long, seconds
+  recheck_hits: 100 # race again after this many preferred-IP reuses
+  recheck_age: 21600 # ...or after the remembered winner is this old, seconds
 
 # Fixed domains to refresh on schedule (A records): field=fqdn, value=interval
 # seconds. Populate the hash on Redis, e.g.:

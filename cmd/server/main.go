@@ -52,7 +52,9 @@ func main() {
 		time.Duration(cfg.Upstream.Timeout)*time.Second,
 	)
 	if cfg.Race.IsEnabled() {
-		res.EnableRace(cfg.Race.PortList(), cfg.Race.TimeoutDur())
+		res.EnableRace(cfg.Race.PortList(), cfg.Race.TimeoutDur(), cfg.Race.TCPDeadlineDur(), cfg.Race.ICMPEnabled())
+		res.EnablePref(resolver.NewRedisPrefBackend(rdb),
+			cfg.Race.PrefTTLDur(), cfg.Race.PrefNegTTLDur(), cfg.Race.RecheckHitsN(), cfg.Race.RecheckAgeDur())
 	}
 	srv := server.New(
 		rdb,
@@ -66,9 +68,10 @@ func main() {
 		time.Duration(cfg.Prefetch.Interval)*time.Second,
 	)
 
-	log.Printf("server: starting upstream=%s/%s timeout=%ds workers=%d cache_ttl=%ds neg_ttl=%ds resp_max=%d prefetch=%ds race=%v ports=%v budget=%s",
+	log.Printf("server: starting upstream=%s/%s timeout=%ds workers=%d cache_ttl=%ds neg_ttl=%ds resp_max=%d prefetch=%ds race=%v ports=%v budget=%s tcp_deadline=%s icmp=%v pref_ttl=%s pref_neg_ttl=%s recheck=%d/%s",
 		cfg.Upstream.Addr, cfg.Upstream.Network, cfg.Upstream.Timeout, cfg.Workers, cfg.CacheTTL, cfg.NegTTL, cfg.RespMax, cfg.Prefetch.Interval,
-		cfg.Race.IsEnabled(), cfg.Race.PortList(), cfg.Race.TimeoutDur())
+		cfg.Race.IsEnabled(), cfg.Race.PortList(), cfg.Race.TimeoutDur(), cfg.Race.TCPDeadlineDur(), cfg.Race.ICMPEnabled(),
+		cfg.Race.PrefTTLDur(), cfg.Race.PrefNegTTLDur(), cfg.Race.RecheckHitsN(), cfg.Race.RecheckAgeDur())
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server: %v", err)

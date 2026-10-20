@@ -11,8 +11,9 @@ import (
 	"github.com/miekg/dns"
 )
 
-// scriptedDialer returns per-address fake probe results: an address present
-// in delays succeeds after that delay; any other address fails at once.
+// scriptedDialer returns per-address fake probe results: an address
+// present in delays succeeds after that delay; any other address fails
+// at once.
 type scriptedDialer struct {
 	delays map[string]time.Duration
 }
@@ -30,56 +31,136 @@ func (s scriptedDialer) dial(ctx context.Context, address string) (time.Duration
 	}
 }
 
+// scriptedPinger is the ICMP analogue of scriptedDialer, keyed by IP.
+type scriptedPinger struct {
+	delays map[string]time.Duration
+}
+
+func (s scriptedPinger) ping(ctx context.Context, ip net.IP) (time.Duration, error) {
+	d, ok := s.delays[ip.String()]
+	if !ok {
+		return 0, errors.New("no route to host")
+	}
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-time.After(d):
+		return d, nil
+	}
+}
+
 func addr(ip string, port int) string {
 	return net.JoinHostPort(ip, fmt.Sprint(port))
 }
 
 func racingResolver(dial dialFunc, timeout time.Duration) *Resolver {
-	return &Resolver{race: &raceConfig{ports: []int{443, 80}, timeout: timeout, dial: dial}}
+	return &Resolver{race: &raceConfig{ports: []int{443, 80}, timeout: timeout, tcpDeadline: 200 * time.Millisecond, dial: dial}}
 }
 
-func TestPickFastestPrimaryWins(t *testing.T) {
+func twoIPs() []net.IP {
+	return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}
+}
+
+func TestPickWinnerPrimaryWins(t *testing.T) {
 	d := scriptedDialer{delays: map[string]time.Duration{
 		addr("192.0.2.1", 443): 60 * time.Millisecond,
 		addr("192.0.2.2", 443): 15 * time.Millisecond,
 	}}
-	winner, port, _ := pickFastest([]net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")},
-		[]int{443, 80}, 500*time.Millisecond, d.dial)
-	if winner == nil || winner.String() != "192.0.2.2" || port != 443 {
-		t.Fatalf("winner=%v port=%d, want 192.0.2.2:443", winner, port)
+	winner, via, _ := pickWinner(twoIPs(), []int{443, 80}, 500*time.Millisecond, 200*time.Millisecond, d.dial, nil)
+	if winner == nil || winner.String() != "192.0.2.2" || via != "tcp/443" {
+		t.Fatalf("winner=%v via=%s, want 192.0.2.2 tcp/443", winner, via)
 	}
 }
 
-func TestPickFastestPrimaryBeatsFasterSecondary(t *testing.T) {
-	// A quick port-80 answer must not preempt a port-443 success that lands
-	// within the budget: 443 is the port real traffic will use.
+func TestPickWinnerPrimaryBeatsFasterSecondary(t *testing.T) {
+	// A quick port-80 answer must not preempt a port-443 success that
+	// lands within the deadline: 443 is the port real traffic will use.
 	d := scriptedDialer{delays: map[string]time.Duration{
 		addr("192.0.2.1", 80):  5 * time.Millisecond,
 		addr("192.0.2.2", 443): 40 * time.Millisecond,
 	}}
-	winner, port, _ := pickFastest([]net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")},
-		[]int{443, 80}, 600*time.Millisecond, d.dial)
-	if winner == nil || winner.String() != "192.0.2.2" || port != 443 {
-		t.Fatalf("winner=%v port=%d, want 192.0.2.2:443", winner, port)
+	winner, via, _ := pickWinner(twoIPs(), []int{443, 80}, 600*time.Millisecond, 200*time.Millisecond, d.dial, nil)
+	if winner == nil || winner.String() != "192.0.2.2" || via != "tcp/443" {
+		t.Fatalf("winner=%v via=%s, want 192.0.2.2 tcp/443", winner, via)
 	}
 }
 
-func TestPickFastestFallsBackToSecondaryAtDeadline(t *testing.T) {
+func TestPickWinnerFallsBackToSecondary(t *testing.T) {
 	d := scriptedDialer{delays: map[string]time.Duration{
 		addr("192.0.2.1", 80): 20 * time.Millisecond,
 		addr("192.0.2.2", 80): 35 * time.Millisecond,
 	}}
-	winner, port, _ := pickFastest([]net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")},
-		[]int{443, 80}, 200*time.Millisecond, d.dial)
-	if winner == nil || winner.String() != "192.0.2.1" || port != 80 {
-		t.Fatalf("winner=%v port=%d, want 192.0.2.1:80", winner, port)
+	p := scriptedPinger{delays: map[string]time.Duration{}}
+	winner, via, _ := pickWinner(twoIPs(), []int{443, 80}, 500*time.Millisecond, 200*time.Millisecond, d.dial, p.ping)
+	if winner == nil || winner.String() != "192.0.2.1" || via != "tcp/80" {
+		t.Fatalf("winner=%v via=%s, want 192.0.2.1 tcp/80", winner, via)
 	}
 }
 
-func TestPickFastestNoFinisher(t *testing.T) {
+func TestPickWinnerFallbackBeatsICMPAtDeadline(t *testing.T) {
+	// The port-80 success landed inside the TCP deadline, so it beats
+	// the (faster) ICMP result even though a port-443 probe is still
+	// outstanding past the deadline.
+	d := scriptedDialer{delays: map[string]time.Duration{
+		addr("192.0.2.1", 80):  20 * time.Millisecond,
+		addr("192.0.2.2", 443): 300 * time.Millisecond,
+	}}
+	p := scriptedPinger{delays: map[string]time.Duration{
+		"192.0.2.1": 10 * time.Millisecond,
+		"192.0.2.2": 10 * time.Millisecond,
+	}}
+	winner, via, _ := pickWinner(twoIPs(), []int{443, 80}, 900*time.Millisecond, 200*time.Millisecond, d.dial, p.ping)
+	if winner == nil || winner.String() != "192.0.2.1" || via != "tcp/80" {
+		t.Fatalf("winner=%v via=%s, want 192.0.2.1 tcp/80", winner, via)
+	}
+}
+
+func TestPickWinnerSlowTCPFallsToICMP(t *testing.T) {
+	// No TCP success within the 200ms deadline: the fastest ICMP reply
+	// takes over, well before the slow TCP probes would have returned.
+	d := scriptedDialer{delays: map[string]time.Duration{
+		addr("192.0.2.1", 443): 300 * time.Millisecond,
+		addr("192.0.2.2", 443): 300 * time.Millisecond,
+	}}
+	p := scriptedPinger{delays: map[string]time.Duration{
+		"192.0.2.1": 50 * time.Millisecond,
+		"192.0.2.2": 30 * time.Millisecond,
+	}}
+	start := time.Now()
+	winner, via, _ := pickWinner(twoIPs(), []int{443, 80}, 900*time.Millisecond, 200*time.Millisecond, d.dial, p.ping)
+	elapsed := time.Since(start)
+	if winner == nil || winner.String() != "192.0.2.2" || via != "icmp" {
+		t.Fatalf("winner=%v via=%s, want 192.0.2.2 icmp", winner, via)
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("took %s, want the ICMP handover at the ~200ms deadline", elapsed)
+	}
+}
+
+func TestPickWinnerDeadTCPEarlyICMP(t *testing.T) {
+	// Every TCP probe refuses at once, so the race must hand over to
+	// ICMP immediately instead of idling until the deadline — this is
+	// the imap-style case (no web ports at all).
 	d := scriptedDialer{delays: map[string]time.Duration{}}
-	winner, _, _ := pickFastest([]net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")},
-		[]int{443, 80}, 200*time.Millisecond, d.dial)
+	p := scriptedPinger{delays: map[string]time.Duration{
+		"192.0.2.1": 40 * time.Millisecond,
+		"192.0.2.2": 10 * time.Millisecond,
+	}}
+	start := time.Now()
+	winner, via, _ := pickWinner(twoIPs(), []int{443, 80}, 900*time.Millisecond, 200*time.Millisecond, d.dial, p.ping)
+	elapsed := time.Since(start)
+	if winner == nil || winner.String() != "192.0.2.2" || via != "icmp" {
+		t.Fatalf("winner=%v via=%s, want 192.0.2.2 icmp", winner, via)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Fatalf("took %s, want early ICMP handover well under the 200ms deadline", elapsed)
+	}
+}
+
+func TestPickWinnerNoFinisher(t *testing.T) {
+	d := scriptedDialer{delays: map[string]time.Duration{}}
+	p := scriptedPinger{delays: map[string]time.Duration{}}
+	winner, _, _ := pickWinner(twoIPs(), []int{443, 80}, 200*time.Millisecond, 100*time.Millisecond, d.dial, p.ping)
 	if winner != nil {
 		t.Fatalf("winner=%v, want nil", winner)
 	}
@@ -174,7 +255,8 @@ func TestApplyRaceAAAA(t *testing.T) {
 
 // TestResolveRacesEndToEnd runs Resolve against a fake upstream whose
 // answer lists a dead loopback address first and a live one second, with
-// real TCP probes: the answer must come back narrowed to the live address.
+// real TCP probes: the answer must come back narrowed to the live
+// address.
 func TestResolveRacesEndToEnd(t *testing.T) {
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -222,7 +304,7 @@ func TestResolveRacesEndToEnd(t *testing.T) {
 	defer func() { _ = srv.Shutdown() }()
 
 	r := New(pc.LocalAddr().String(), "udp", 3*time.Second)
-	r.EnableRace([]int{port}, time.Second)
+	r.EnableRace([]int{port}, time.Second, 200*time.Millisecond, true)
 	resp, err := r.Resolve("example.com", dns.TypeA)
 	if err != nil {
 		t.Fatal(err)

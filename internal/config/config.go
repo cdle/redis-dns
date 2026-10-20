@@ -79,12 +79,19 @@ type Prefetch struct {
 
 // Race configures server-side answer racing (see internal/resolver): when an
 // upstream answer carries several IPs, the server probes them concurrently
-// and narrows the answer to the fastest-responding one. Racing is enabled
-// unless the config explicitly disables it.
+// (TCP on Ports plus ICMP echo) and narrows the answer to the
+// best-responding one. Racing is enabled unless the config explicitly
+// disables it.
 type Race struct {
-	Enabled *bool `yaml:"enabled"`    // nil = enabled; set false to disable
-	Ports   []int `yaml:"ports"`      // probe ports in priority order; empty = [443 80]
-	Timeout int   `yaml:"timeout_ms"` // overall probe budget, ms; <=0 = 1000
+	Enabled     *bool `yaml:"enabled"`         // nil = enabled; set false to disable
+	Ports       []int `yaml:"ports"`           // probe ports in priority order; empty = [443 80]
+	Timeout     int   `yaml:"timeout_ms"`      // overall probe budget, ms; <=0 = 1000
+	TCPDeadline int   `yaml:"tcp_deadline_ms"` // window TCP gets before ICMP takes over, ms; <=0 = 200
+	ICMP        *bool `yaml:"icmp"`            // nil = enabled; set false to disable ICMP probing
+	PrefTTL     int   `yaml:"pref_ttl"`        // preferred-IP entry lifetime, seconds; <=0 = 86400
+	PrefNegTTL  int   `yaml:"pref_neg_ttl"`    // negative preferred-IP entry lifetime, seconds; <=0 = 600
+	RecheckHits int   `yaml:"recheck_hits"`    // pref hits before a revalidation race; <=0 = 100
+	RecheckAge  int   `yaml:"recheck_age"`     // pref age before a revalidation race, seconds; <=0 = 21600
 }
 
 // IsEnabled reports whether answer racing is on.
@@ -104,6 +111,54 @@ func (r Race) TimeoutDur() time.Duration {
 		return time.Duration(r.Timeout) * time.Millisecond
 	}
 	return time.Second
+}
+
+// TCPDeadlineDur returns the window TCP probes get before the race
+// falls back to ICMP results, defaulting to 200ms.
+func (r Race) TCPDeadlineDur() time.Duration {
+	if r.TCPDeadline > 0 {
+		return time.Duration(r.TCPDeadline) * time.Millisecond
+	}
+	return 200 * time.Millisecond
+}
+
+// ICMPEnabled reports whether ICMP echo probing joins the race.
+func (r Race) ICMPEnabled() bool { return r.ICMP == nil || *r.ICMP }
+
+// PrefTTLDur returns the lifetime of a positive preferred-IP entry,
+// defaulting to 24h.
+func (r Race) PrefTTLDur() time.Duration {
+	if r.PrefTTL > 0 {
+		return time.Duration(r.PrefTTL) * time.Second
+	}
+	return 24 * time.Hour
+}
+
+// PrefNegTTLDur returns the lifetime of a negative preferred-IP
+// entry, defaulting to 10 minutes.
+func (r Race) PrefNegTTLDur() time.Duration {
+	if r.PrefNegTTL > 0 {
+		return time.Duration(r.PrefNegTTL) * time.Second
+	}
+	return 10 * time.Minute
+}
+
+// RecheckHitsN returns how many pref hits trigger a revalidation
+// race, defaulting to 100.
+func (r Race) RecheckHitsN() int64 {
+	if r.RecheckHits > 0 {
+		return int64(r.RecheckHits)
+	}
+	return 100
+}
+
+// RecheckAgeDur returns the pref age that triggers a revalidation
+// race, defaulting to 6h.
+func (r Race) RecheckAgeDur() time.Duration {
+	if r.RecheckAge > 0 {
+		return time.Duration(r.RecheckAge) * time.Second
+	}
+	return 6 * time.Hour
 }
 
 // Default returns a configuration with sensible defaults.
