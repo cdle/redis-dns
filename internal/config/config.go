@@ -38,8 +38,10 @@ type Redis struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
-	PoolSize int    `yaml:"pool_size"` // connection pool size; 0 = small default (4)
-	Socks5   string `yaml:"socks5"`    // optional SOCKS5 proxy addr; empty = direct
+	PoolSize   int    `yaml:"pool_size"`   // connection pool size; 0 = small default (4)
+	Socks5     string `yaml:"socks5"`      // optional SOCKS5 proxy addr; empty = direct
+	TLS        bool   `yaml:"tls"`         // enable TLS (e.g. stunnel terminator in front of Redis)
+	ServerName string `yaml:"server_name"` // TLS SNI / certificate hostname; empty = derive from addr
 }
 
 // Upstream is the recursive resolver the server queries.

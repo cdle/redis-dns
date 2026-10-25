@@ -150,6 +150,15 @@ func (c *Client) resolveQuery(src string, r *dns.Msg) ([]byte, int) {
 		return nil, dns.RcodeServerFailure
 	}
 	resp := v.(proto.Response)
+	if len(resp.Wire) == 0 {
+		// 合法的空答案（如无 AAAA 记录的 NOERROR）：立即返回 NODATA 形式的空应答，不挂超时。
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Rcode = resp.Rcode
+		log.Printf("client: query src=%s name=%s type=%d path=upstream rcode=%d empty-answer took=%s", src, name, q.Qtype, resp.Rcode, time.Since(start))
+		wire, _ := m.Pack()
+		return wire, resp.Rcode
+	}
 	c.localSet(key, resp.Wire, resp.ResolvedAt)
 	log.Printf("client: query src=%s name=%s type=%d path=upstream rcode=%d took=%s", src, name, q.Qtype, resp.Rcode, time.Since(start))
 	return resp.Wire, dns.RcodeSuccess
@@ -260,9 +269,6 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 		if resp.Err != "" {
 			return resp, errors.New(resp.Err)
 		}
-		if len(resp.Wire) == 0 {
-			return resp, errors.New("empty answer")
-		}
 		return resp, nil
 	case err := <-xaddErr:
 		// The XADD confirmation only means the request landed in the stream —
@@ -275,9 +281,6 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 		case resp := <-ch:
 			if resp.Err != "" {
 				return resp, errors.New(resp.Err)
-			}
-			if len(resp.Wire) == 0 {
-				return resp, errors.New("empty answer")
 			}
 			return resp, nil
 		case <-time.After(c.block):

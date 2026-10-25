@@ -105,7 +105,7 @@ func (s *Server) worker(ctx context.Context, consumer string) {
 			Consumer: consumer,
 			Streams:  []string{redisx.StreamRequests, ">"},
 			Count:    16,
-			Block:    0,
+			Block:    30 * time.Second,
 		}).Result()
 		if err != nil {
 			if ctx.Err() != nil {

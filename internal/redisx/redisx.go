@@ -4,6 +4,7 @@ package redisx
 
 import (
 	"context"
+	"crypto/tls"
 	"log"
 	"net"
 	"strconv"
@@ -55,8 +56,9 @@ func CacheKey(name string, qtype uint16) string {
 // concurrent handlers need a larger pool than clients (each blocking
 // XReadGroup/XRead consumes one connection for its whole duration).
 // If socks5Addr is non-empty, all Redis connections are dialed through
-// that SOCKS5 proxy.
-func New(addr, username, password string, db, poolSize int, socks5Addr string) *redis.Client {
+// that SOCKS5 proxy. If useTLS is true, connections are wrapped in TLS
+// with serverName as SNI (for a terminator such as stunnel in front of Redis).
+func New(addr, username, password string, db, poolSize int, socks5Addr string, useTLS bool, serverName string) *redis.Client {
 	if poolSize < 1 {
 		poolSize = 4
 	}
@@ -80,6 +82,14 @@ func New(addr, username, password string, db, poolSize int, socks5Addr string) *
 		opts.Dialer = func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return contextDialer.DialContext(ctx, network, addr)
 		}
+	}
+	if useTLS {
+		if serverName == "" {
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				serverName = h
+			}
+		}
+		opts.TLSConfig = &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
 	}
 	return redis.NewClient(opts)
 }
