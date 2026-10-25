@@ -1,7 +1,7 @@
 # Client-side (LAN) deployment config — copy to /etc/redis-dns/config.client.yaml
 # and fill in the real Redis password.
 redis:
-  addr: "127.0.0.1:6380"  # server-side Redis (bwg)
+  addr: "127.0.0.1:6380"    # server-side Redis (loopback on bwg), reached via SOCKS5
   password: "CHANGE_ME"
   db: 0
   socks5: "127.0.0.1:1080"  # route Redis through local SOCKS5 proxy (ni-client); empty = direct

@@ -1,7 +1,7 @@
 # Client-side (LAN) example — run: redis-dns-client -config config.client.yaml
 redis:
-  addr: "bwg.example.com:6380"  # server host's Redis, reached via SOCKS5 below
-  socks5: "127.0.0.1:1080"      # optional SOCKS5 proxy; empty = direct
+  addr: "127.0.0.1:6380"        # server-side Redis (loopback on bwg), via SOCKS5 below
+  socks5: "127.0.0.1:1080"      # local SOCKS5 proxy (ni tunnel); empty = direct
   password: "CHANGE_ME"
   db: 0
 
