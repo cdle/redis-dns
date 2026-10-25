@@ -36,7 +36,7 @@ func main() {
 	if pool == 0 {
 		pool = 8
 	}
-	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB, pool, cfg.Redis.TLS, cfg.Redis.ServerName)
+	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB, pool, cfg.Redis.Socks5)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -54,12 +54,8 @@ func main() {
 		time.Duration(cfg.LocalTTL)*time.Second,
 	)
 
-	if cfg.Follow.API != "" {
-		go client.RunFollow(ctx, cfg.Follow, cfg.Redis.Password, cfg.Redis.DB, c)
-	}
-
-	log.Printf("client: starting listen=%s doh=%s redis=%s block=%ds local_ttl=%ds",
-		cfg.Listen, cfg.DOHListen, cfg.Redis.Addr, cfg.BlockTime, cfg.LocalTTL)
+	log.Printf("client: starting listen=%s doh=%s redis=%s socks5=%s block=%ds local_ttl=%ds",
+		cfg.Listen, cfg.DOHListen, cfg.Redis.Addr, cfg.Redis.Socks5, cfg.BlockTime, cfg.LocalTTL)
 
 	if err := c.ListenAndServe(ctx, cfg.Listen, cfg.DOHListen); err != nil {
 		log.Fatalf("client: %v", err)

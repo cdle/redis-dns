@@ -4,7 +4,6 @@ package redisx
 
 import (
 	"context"
-	"crypto/tls"
 	"log"
 	"net"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/net/proxy"
 )
 
 // Stream, channel, and key names.
@@ -54,9 +54,9 @@ func CacheKey(name string, qtype uint16) string {
 // poolSize controls how many connections the pool holds; servers running
 // concurrent handlers need a larger pool than clients (each blocking
 // XReadGroup/XRead consumes one connection for its whole duration).
-// If serverName is non-empty and tls is true, connections are wrapped in
-// TLS with that SNI (for a terminator such as stunnel in front of Redis).
-func New(addr, username, password string, db, poolSize int, useTLS bool, serverName string) *redis.Client {
+// If socks5Addr is non-empty, all Redis connections are dialed through
+// that SOCKS5 proxy.
+func New(addr, username, password string, db, poolSize int, socks5Addr string) *redis.Client {
 	if poolSize < 1 {
 		poolSize = 4
 	}
@@ -68,14 +68,18 @@ func New(addr, username, password string, db, poolSize int, useTLS bool, serverN
 		PoolSize:     poolSize,
 		MinIdleConns: poolSize / 2,
 	}
-	if useTLS {
-		if serverName == "" {
-			if h, _, err := net.SplitHostPort(addr); err == nil {
-				serverName = h
-			}
+	if socks5Addr != "" {
+		dialer, err := proxy.SOCKS5("tcp", socks5Addr, nil, proxy.Direct)
+		if err != nil {
+			log.Fatalf("redisx: socks5 dialer %s: %v", socks5Addr, err)
 		}
-		tlsCfg := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
-		opts.TLSConfig = tlsCfg
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			log.Fatalf("redisx: socks5 dialer %s does not support DialContext", socks5Addr)
+		}
+		opts.Dialer = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return contextDialer.DialContext(ctx, network, addr)
+		}
 	}
 	return redis.NewClient(opts)
 }

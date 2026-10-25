@@ -1,6 +1,7 @@
 # Client-side (LAN) example — run: redis-dns-client -config config.client.yaml
 redis:
-  addr: "127.0.0.1:6379"  # through the SSH tunnel to the server host
+  addr: "bwg.example.com:6380"  # server host's Redis, reached via SOCKS5 below
+  socks5: "127.0.0.1:1080"      # optional SOCKS5 proxy; empty = direct
   password: "CHANGE_ME"
   db: 0
 

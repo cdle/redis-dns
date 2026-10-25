@@ -1,6 +1,6 @@
 # Server-side (bwg) example — run: redis-dns-server -config config.server.yaml
 redis:
-  addr: "127.0.0.1:6379"
+  addr: "127.0.0.1:6380"
   password: "CHANGE_ME"
   db: 0
 

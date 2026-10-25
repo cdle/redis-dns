@@ -30,20 +30,16 @@ type Config struct {
 	Workers  int      `yaml:"workers"`   // number of concurrent consumer workers; 0 = GOMAXPROCS
 	Prefetch Prefetch `yaml:"prefetch"`
 	Race     Race     `yaml:"race"`
-
-	// Client settings.
-	Follow Follow `yaml:"follow"` // empty API disables node following
 }
 
 // Redis holds the Redis connection parameters.
 type Redis struct {
-	Addr       string `yaml:"addr"`
-	Username   string `yaml:"username"`
-	Password   string `yaml:"password"`
-	DB         int    `yaml:"db"`
-	PoolSize   int    `yaml:"pool_size"`   // connection pool size; 0 = small default (4)
-	TLS        bool   `yaml:"tls"`         // enable TLS (e.g. stunnel terminator in front of Redis)
-	ServerName string `yaml:"server_name"` // TLS SNI / certificate hostname; empty = derive from addr
+	Addr     string `yaml:"addr"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
+	PoolSize int    `yaml:"pool_size"` // connection pool size; 0 = small default (4)
+	Socks5   string `yaml:"socks5"`    // optional SOCKS5 proxy addr; empty = direct
 }
 
 // Upstream is the recursive resolver the server queries.
@@ -51,23 +47,6 @@ type Upstream struct {
 	Addr    string `yaml:"addr"`
 	Network string `yaml:"network"` // udp, tcp, tcp-tls
 	Timeout int    `yaml:"timeout"` // seconds
-}
-
-// Follow is the optional proxy-node-following configuration (client only):
-// watch a mihomo policy group and keep the redis backend pinned to the node
-// that is actually in use.
-type Follow struct {
-	API      string                   `yaml:"api"`      // mihomo external-controller URL
-	Token    string                   `yaml:"token"`    // bearer token
-	Group    string                   `yaml:"group"`    // policy group to watch
-	Interval int                      `yaml:"interval"` // seconds between polls
-	Backends map[string]FollowBackend `yaml:"backends"` // node name -> redis-dns backend
-}
-
-// FollowBackend points at the redis-dns server of one proxy node.
-type FollowBackend struct {
-	Addr string `yaml:"addr"`
-	SNI  string `yaml:"sni"`
 }
 
 // Prefetch configures scheduled refresh of hot domains. Interval of 0
