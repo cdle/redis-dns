@@ -214,6 +214,8 @@ func (c *Client) dohHandler(w http.ResponseWriter, r *http.Request) {
 func (c *Client) serveDoH(ctx context.Context, addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", c.dohHandler)
+	mux.HandleFunc("/reverse", c.reverseHandler)
+	mux.HandleFunc("/reverse/stats", c.reverseStatsHandler)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		<-ctx.Done()
