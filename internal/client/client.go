@@ -216,6 +216,10 @@ func (c *Client) serveDoH(ctx context.Context, addr string) {
 	mux.HandleFunc("/dns-query", c.dohHandler)
 	mux.HandleFunc("/reverse", c.reverseHandler)
 	mux.HandleFunc("/reverse/stats", c.reverseStatsHandler)
+	mux.HandleFunc("/panel", c.panelHandler)
+	mux.HandleFunc("/panel/run", c.panelRunHandler)
+	mux.HandleFunc("/panel/cache", c.panelCacheListHandler)
+	mux.HandleFunc("/panel/cache/clear", c.panelCacheClearHandler)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		<-ctx.Done()
