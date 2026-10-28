@@ -118,8 +118,6 @@ func (s *Server) worker(ctx context.Context, consumer string) {
 				select {
 				case <-ctx.Done():
 					return
-				case <-s.jobs:
-					// drain signal（不应发生）
 				case msg, ok := <-ch:
 					if !ok {
 						return // 连接断开，外层重连
