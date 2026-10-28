@@ -207,15 +207,15 @@ func (s *Server) handle(ctx context.Context, req proto.Request) {
 // (and by negTTL for negative answers), so the Redis cache never outlives the
 // real records it holds.
 func (s *Server) cache(ctx context.Context, name string, qtype uint16, wire []byte, answer *dns.Msg) time.Duration {
-	ttl := s.cacheTTL
+	// 缓存 TTL 统一 60s，不按记录自身 TTL 缩短：记录 TTL 只有 5-16s 时
+	// （netflix/openai 这类），缓存 55s+ 是空的，每次查询都吃真实解析。
+	// 60s 与预热周期一致；stale 影子再兜 60s（stale-while-revalidate）。
+	ttl := 60 * time.Second
 	if answer.Rcode == dns.RcodeNameError {
-		ttl = s.negTTL
+		ttl = 60 * time.Second
 	}
-	if ttl <= 0 {
-		return 0
-	}
-	if min := resolver.MinTTL(answer); min > 0 && time.Duration(min)*time.Second < ttl {
-		ttl = time.Duration(min) * time.Second
+	if s.cacheTTL > 0 && s.cacheTTL < ttl {
+		ttl = s.cacheTTL
 	}
 	key := redisx.CacheKey(name, qtype)
 	if err := s.rdb.Set(ctx, key, wire, ttl).Err(); err != nil {
