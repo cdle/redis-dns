@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -69,6 +70,10 @@ func New(addr, username, password string, db, poolSize int, socks5Addr string, u
 		DB:           db,
 		PoolSize:     poolSize,
 		MinIdleConns: poolSize / 2,
+		// 并发查询超过空闲连接时，go-redis 会现场拨号建连。跨公网 TLS
+		// 的握手要几百毫秒，与其让请求等建连，不如尽快失败/复用：
+		// PoolTimeout 给一个远小于 DialTimeout 的上限，避免请求悬挂。
+		PoolTimeout: 2 * time.Second,
 	}
 	if socks5Addr != "" {
 		dialer, err := proxy.SOCKS5("tcp", socks5Addr, nil, proxy.Direct)
@@ -119,4 +124,24 @@ func StartKeepalive(ctx context.Context, c *redis.Client, interval time.Duration
 			}
 		}
 	}()
+}
+
+// WarmPool dials n idle connections ahead of time by issuing cheap PINGs
+// through the pool. Called at startup (and after backend swaps) so the first
+// burst of concurrent queries does not pay the TLS handshake cost itself.
+func WarmPool(ctx context.Context, c *redis.Client, n int) {
+	if n < 1 {
+		return
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			_ = c.Ping(wctx).Err()
+		}()
+	}
+	wg.Wait()
 }

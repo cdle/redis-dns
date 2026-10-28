@@ -34,10 +34,10 @@ type Config struct {
 
 // Redis holds the Redis connection parameters.
 type Redis struct {
-	Addr     string `yaml:"addr"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	DB       int    `yaml:"db"`
+	Addr       string `yaml:"addr"`
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	DB         int    `yaml:"db"`
 	PoolSize   int    `yaml:"pool_size"`   // connection pool size; 0 = small default (4)
 	Socks5     string `yaml:"socks5"`      // optional SOCKS5 proxy addr; empty = direct
 	TLS        bool   `yaml:"tls"`         // enable TLS (e.g. stunnel terminator in front of Redis)

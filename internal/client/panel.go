@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -81,6 +82,24 @@ func (c *Client) panelRunHandler(w http.ResponseWriter, r *http.Request) {
 	if len(in.Queries) > 64 {
 		in.Queries = in.Queries[:64]
 	}
+
+	// 预热连接池：清缓存后并发测试想测的是解析路径而非建连成本。
+	// 用与查询数相同的 ping 数把池撑起来（幂等，池已热时 <1ms）。
+	warmCtx, warmCancel := context.WithTimeout(r.Context(), 8*time.Second)
+	var warmWG sync.WaitGroup
+	need := len(in.Queries)
+	if need > 16 {
+		need = 16
+	}
+	for i := 0; i < need; i++ {
+		warmWG.Add(1)
+		go func() {
+			defer warmWG.Done()
+			_ = c.rdb.Ping(warmCtx).Err()
+		}()
+	}
+	warmWG.Wait()
+	warmCancel()
 
 	start := time.Now()
 	results := make([]panelTestResult, len(in.Queries))

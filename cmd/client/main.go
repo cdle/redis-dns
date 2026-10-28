@@ -48,6 +48,10 @@ func main() {
 	// silently drop them; this removes the first-query-after-idle spike.
 	redisx.StartKeepalive(ctx, rdb, 15*time.Second)
 
+	// Pre-dial half the pool so the first burst of concurrent queries does
+	// not each pay a cross-internet TLS handshake (~500ms) itself.
+	redisx.WarmPool(ctx, rdb, pool/2)
+
 	c := client.New(
 		rdb,
 		time.Duration(cfg.BlockTime)*time.Second,
