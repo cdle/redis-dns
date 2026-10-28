@@ -309,10 +309,14 @@ func (c *Client) runDispatcher(ctx context.Context) {
 	lastID := "$"
 	backoff := time.Second
 	for ctx.Err() == nil {
+		// 阻塞等第一批响应。Block 5s（而不是 0）：
+		// go-redis 对 Block=0 会设置 readTimeout=0（无限期）且 Redis 端
+		// BLOCK 0 同样无限期；使用有限 BLOCK 让连接在空闲时定期归还池，
+		// 也让 ctx 取消能及时生效。
 		streams, err := c.rdb.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{redisx.StreamResponses, lastID},
 			Count:   100,
-			Block:   0,
+			Block:   5 * time.Second,
 		}).Result()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -329,22 +333,46 @@ func (c *Client) runDispatcher(ctx context.Context) {
 			continue
 		}
 		backoff = time.Second
-		for _, st := range streams {
-			for _, msg := range st.Messages {
-				lastID = msg.ID
-				data, ok := msg.Values["data"].(string)
-				if !ok {
-					continue
-				}
-				var resp proto.Response
-				if err := json.Unmarshal([]byte(data), &resp); err != nil {
-					continue
-				}
-				log.Printf("client: resp-recv id=%s", shortID(resp.ID))
-				c.dispatch(resp)
+		n := c.dispatchBatch(streams, &lastID)
+
+		// 关键：并发一批响应几乎同时写进流，BLOCK 唤醒只保证读到其中
+		// 一部分（先到的）。立刻用非阻塞 XREAD 把积压读空，否则剩下的
+		// 响应要等下一轮 BLOCK 唤醒，在公网链路上白付一个 RTT。
+		for n > 0 {
+			streams, err = c.rdb.XRead(ctx, &redis.XReadArgs{
+				Streams: []string{redisx.StreamResponses, lastID},
+				Count:   100,
+				Block:   -1, // 非阻塞：go-redis 不加 BLOCK 参数
+			}).Result()
+			if err != nil {
+				break // redis.Nil = 读尽
 			}
+			n = c.dispatchBatch(streams, &lastID)
 		}
 	}
+}
+
+// dispatchBatch dispatches messages from one XREAD result and updates lastID.
+// Returns the number of messages read.
+func (c *Client) dispatchBatch(streams []redis.XStream, lastID *string) int {
+	n := 0
+	for _, st := range streams {
+		for _, msg := range st.Messages {
+			*lastID = msg.ID
+			n++
+			data, ok := msg.Values["data"].(string)
+			if !ok {
+				continue
+			}
+			var resp proto.Response
+			if err := json.Unmarshal([]byte(data), &resp); err != nil {
+				continue
+			}
+			log.Printf("client: resp-recv id=%s", shortID(resp.ID))
+			c.dispatch(resp)
+		}
+	}
+	return n
 }
 
 // runSubscriber subscribes to the updates channel and warms the local cache
