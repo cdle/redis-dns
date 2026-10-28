@@ -12,8 +12,9 @@ import (
 
 // Config is the shared runtime configuration for both binaries.
 type Config struct {
-	Redis    Redis    `yaml:"redis"`
-	Upstream Upstream `yaml:"upstream"`
+	Redis       Redis    `yaml:"redis"`
+	RedisBackup Redis    `yaml:"redis_backup"` // 可选备用线路（不同物理路径），空则单线路
+	Upstream    Upstream `yaml:"upstream"`
 
 	// Client settings.
 	Listen    string `yaml:"listen"`     // DNS listen address (client only)

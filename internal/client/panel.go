@@ -87,10 +87,7 @@ func (c *Client) panelRunHandler(w http.ResponseWriter, r *http.Request) {
 	// 用与查询数相同的 ping 数把池撑起来（幂等，池已热时 <1ms）。
 	warmCtx, warmCancel := context.WithTimeout(r.Context(), 8*time.Second)
 	var warmWG sync.WaitGroup
-	need := len(in.Queries)
-	if need > 16 {
-		need = 16
-	}
+	need := 32 // 撑满整个连接池：突发建连撞丢包窗口是冷启动长尾主因
 	for i := 0; i < need; i++ {
 		warmWG.Add(1)
 		go func() {

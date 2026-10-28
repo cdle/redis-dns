@@ -37,6 +37,14 @@ func main() {
 		pool = 8
 	}
 	rdb := redisx.New(cfg.Redis.Addr, cfg.Redis.Username, cfg.Redis.Password, cfg.Redis.DB, pool, cfg.Redis.Socks5, cfg.Redis.TLS, cfg.Redis.ServerName)
+	var rdb2 *redis.Client
+	if cfg.RedisBackup.Addr != "" {
+		bp := cfg.RedisBackup.PoolSize
+		if bp == 0 {
+			bp = 8
+		}
+		rdb2 = redisx.New(cfg.RedisBackup.Addr, cfg.RedisBackup.Username, cfg.RedisBackup.Password, cfg.RedisBackup.DB, bp, cfg.RedisBackup.Socks5, cfg.RedisBackup.TLS, cfg.RedisBackup.ServerName)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -50,13 +58,19 @@ func main() {
 
 	// Pre-dial half the pool so the first burst of concurrent queries does
 	// not each pay a cross-internet TLS handshake (~500ms) itself.
-	redisx.WarmPool(ctx, rdb, pool/2)
+	redisx.WarmPool(ctx, rdb, pool)
 
 	c := client.New(
 		rdb,
 		time.Duration(cfg.BlockTime)*time.Second,
 		time.Duration(cfg.LocalTTL)*time.Second,
 	)
+	if rdb2 != nil {
+		c.SetBackup(rdb2)
+		redisx.WarmPool(ctx, rdb2, 4)
+		redisx.StartKeepalive(ctx, rdb2, 15*time.Second)
+		log.Printf("client: backup redis=%s", cfg.RedisBackup.Addr)
+	}
 
 	log.Printf("client: starting listen=%s doh=%s redis=%s socks5=%s block=%ds local_ttl=%ds",
 		cfg.Listen, cfg.DOHListen, cfg.Redis.Addr, cfg.Redis.Socks5, cfg.BlockTime, cfg.LocalTTL)

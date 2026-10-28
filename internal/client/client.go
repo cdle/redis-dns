@@ -33,6 +33,7 @@ import (
 // on-demand resolution channel, and pushed updates from the server.
 type Client struct {
 	rdb      *redis.Client
+	rdb2     *redis.Client // 可选备用线路；nil 表示单线路
 	block    time.Duration
 	localTTL time.Duration // fallback TTL when the wire carries no usable TTL
 
@@ -61,12 +62,17 @@ func New(rdb *redis.Client, block, localTTL time.Duration) *Client {
 	}
 	return &Client{
 		rdb:      rdb,
+		rdb2:     nil,
 		block:    block,
 		localTTL: localTTL,
 		local:    make(map[string]localEntry),
 		waits:    make(map[string]chan proto.Response),
 	}
 }
+
+// SetBackup sets the optional backup-path Redis client (different physical
+// route). GET racing runs on both paths when set.
+func (c *Client) SetBackup(rdb *redis.Client) { c.rdb2 = rdb }
 
 // ListenAndServe runs the DNS server on addr for both UDP and TCP, plus the
 // response dispatcher and update subscriber, until ctx is cancelled.
@@ -255,75 +261,89 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 	c.register(req.ID, ch)
 	defer c.unregister(req.ID)
 
-	// PUBLISH 立即发出（循环内 attempt=0），不等确认：响应推送与确认走
-	// 不同连接，响应常常先于确认到达。pub/sub 推送偶发丢失（跨公网链路
-	// 抖动、订阅闪断），在 block_time 内重发即可恢复——服务端 cache-first，
-	// 重发命中的是缓存，幂等且便宜。
-	//
-	// 结构：单一 select 同时监听 响应ch / 发布确认 / 重发定时器。
-	// 响应可能在 PUBLISH 确认之前就被 dispatcher 投递，所以 ch 必须始终
-	// 在 select 里，不能在收到确认后切换到嵌套 select（会错过已投递响应，
-	// 这就是并发时一个快、其余慢 1 秒的根因）。（跨公网链路抖动时 PUBLISH 确认延迟、订阅
-	// 连接闪断），在 block_time 内重发请求即可恢复——服务端 cache-first，
-	// 重发命中的是缓存，幂等且便宜。
-	//
-	// 结构：单一 select 同时监听 响应ch / 发布确认 / 重发定时器。
-	// 响应可能在 PUBLISH 确认之前就被 dispatcher 投递（响应推送与确认
-	// 走不同连接，存在竞态），所以 ch 必须始终在 select 里。
 	deadline := time.Now().Add(c.block)
-	attempt := 0
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return proto.Response{}, errors.New("resolution timed out")
+	getCtx, getCancel := context.WithDeadline(ctx, deadline)
+	defer getCancel()
+	type getRes struct {
+		wire []byte
+		err  error
+	}
+	// getCh 贯穿整个 resolve 生命周期：结果永远有人消费，绝不在途取消
+	// （上一版每 150ms cancel 一次，把 190ms 后才返回的命中全丢了——
+	// 这就是"GET hit=true 却超时"的根因）。
+	getCh := make(chan getRes, 32)
+
+	// 驱动循环：PUBLISH 首发一次（服务端 cache-first 幂等，推送+GET 才
+	// 是数据通道）；GET 探测每 60ms 一发（服务端 ~100ms 写缓存，连续
+	// 探测能在缓存写入后 1 个 RTT 内拿到）。主/备线路交替，在途 GET
+	// 自然完成，结果统一进 getCh 由主 select 消费。
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		pubCtx, pubCancel := context.WithTimeout(ctx, time.Until(deadline))
+		started := time.Now()
+		err := c.rdb.Publish(pubCtx, redisx.ChannelRequests, payload).Err()
+		pubCancel()
+		log.Printf("client: pub-req id=%s confirm=%.1fms err=%v",
+			shortID(req.ID), float64(time.Since(started).Microseconds())/1000, err != nil)
+		// 请求也走双路径：主线路首发段丢失时（实测 ~600ms 重传），
+		// 备份路径 ~240ms 就能把请求送到服务端，缓存提前写入。
+		if c.rdb2 != nil {
+			go func() {
+				bCtx, bCancel := context.WithTimeout(ctx, time.Until(deadline))
+				defer bCancel()
+				_ = c.rdb2.Publish(bCtx, redisx.ChannelRequests, payload).Err()
+			}()
 		}
-		// 重发节奏：首发后 400ms（约2个RTT）未确认即重发；确认后 300ms
-		// 未收到推送再重发。快速幂等重试把 TCP 重传长尾压到一个额外 RTT。
-		nextFire := 300 * time.Millisecond
-		if attempt == 0 {
-			nextFire = 400 * time.Millisecond
-		}
-		pubErr := make(chan error, 1)
-		pubCtx, cancel := context.WithTimeout(ctx, remaining)
-		go func(attempt int) {
+
+		doGet := func(cli *redis.Client, tag string) {
 			started := time.Now()
-			err := c.rdb.Publish(pubCtx, redisx.ChannelRequests, payload).Err()
-			log.Printf("client: pub-req id=%s attempt=%d confirm_after_start=%.1fms err=%v",
-				shortID(req.ID), attempt, float64(time.Since(started).Microseconds())/1000, err != nil && err != context.DeadlineExceeded)
-			pubErr <- err
-			cancel()
-		}(attempt)
+			wire, err := cli.Get(getCtx, redisx.CacheKey(name, qtype)).Bytes()
+			hit := err == nil && len(wire) > 0
+			if hit || (err != nil && err != redis.Nil && getCtx.Err() == nil) {
+				log.Printf("client: cache-get id=%s/%s took=%.1fms hit=%v err=%v",
+					shortID(req.ID), tag, float64(time.Since(started).Microseconds())/1000, hit, err != nil && err != redis.Nil)
+			}
+			select {
+			case getCh <- getRes{wire, err}:
+			case <-getCtx.Done():
+			}
+		}
+		i := 0
+		for {
+			if c.rdb2 != nil && i%2 == 1 {
+				go doGet(c.rdb2, "bk")
+			} else {
+				go doGet(c.rdb, "main")
+			}
+			i++
+			select {
+			case <-time.After(60 * time.Millisecond):
+			case <-getCtx.Done():
+				return
+			}
+		}
+	}()
+
+	for {
 		select {
 		case resp := <-ch:
-			cancel()
 			if resp.Err != "" {
 				return resp, errors.New(resp.Err)
 			}
 			return resp, nil
-		case err := <-pubErr:
-			cancel()
-			if err != nil && attempt >= 2 {
-				return proto.Response{}, err
-			}
-			// 确认到了：等推送。300ms（约1.5个RTT）没到就重发——
-			// 服务端 cache-first，重发幂等且便宜；快速重发把 TCP 重传
-			// 造成的长尾从 3s 压到一个额外 RTT。
-			select {
-			case resp := <-ch:
-				if resp.Err != "" {
-					return resp, errors.New(resp.Err)
+		case gr := <-getCh:
+			if gr.err == nil && len(gr.wire) > 0 {
+				var m dns.Msg
+				rcode := dns.RcodeSuccess
+				if m.Unpack(gr.wire) == nil {
+					rcode = m.Rcode
 				}
-				return resp, nil
-			case <-time.After(300 * time.Millisecond):
-				attempt++
-				continue
-			case <-ctx.Done():
-				return proto.Response{}, ctx.Err()
+				return proto.Response{ID: req.ID, Name: name, Type: qtype, Wire: gr.wire, Rcode: rcode, ResolvedAt: time.Now().UnixNano()}, nil
 			}
-		case <-time.After(nextFire):
-			// 确认和响应都没等到：重发
-			attempt++
-			continue
+			// miss 或 Nil：继续等下一批结果
+		case <-getCtx.Done():
+			return proto.Response{}, errors.New("resolution timed out")
 		case <-ctx.Done():
 			return proto.Response{}, ctx.Err()
 		}
