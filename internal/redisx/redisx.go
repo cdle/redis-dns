@@ -18,14 +18,16 @@ import (
 
 // Stream, channel, and key names.
 const (
-	// StreamRequests is the Redis stream the client publishes resolution
-	// requests to and the server consumes from (via a consumer group).
-	StreamRequests = "dns:req"
+	// ChannelRequests is the pub/sub channel the client PUBLISHes resolution
+	// requests on and the server SUBSCRIBEs to. Pub/sub beats streams for
+	// latency: no consumer-group bookkeeping and no polling round-trips.
+	ChannelRequests = "dns:req:ps"
 
-	// StreamResponses is the Redis stream the server publishes answers to and
-	// every client reads from, matching messages by request ID. Capped with
-	// MAXLEN so stale responses for timed-out requests cannot accumulate.
-	StreamResponses = "dns:resp"
+	// ChannelResponses is the pub/sub channel the server PUBLISHes answers
+	// on; clients receive them instantly (PUBLISH is push, no RTT for poll).
+	// Loss tolerance: a missed response only costs the client a retry, and
+	// the answer is cached server-side so the retry hits the cache.
+	ChannelResponses = "dns:resp:ps"
 
 	// ChannelUpdates is the pub/sub channel on which the server broadcasts
 	// freshly resolved answers so clients can warm their local caches.
@@ -70,10 +72,13 @@ func New(addr, username, password string, db, poolSize int, socks5Addr string, u
 		DB:           db,
 		PoolSize:     poolSize,
 		MinIdleConns: poolSize / 2,
-		// 并发查询超过空闲连接时，go-redis 会现场拨号建连。跨公网 TLS
-		// 的握手要几百毫秒，与其让请求等建连，不如尽快失败/复用：
-		// PoolTimeout 给一个远小于 DialTimeout 的上限，避免请求悬挂。
-		PoolTimeout: 2 * time.Second,
+		// 跨公网 TLS 链路上新建连接的握手要几百毫秒，且 go-redis 每次从
+		// 池里取连接都会做健康检查（syscall.Read 探测）。空闲连接被回收
+		// 后重建就是 400ms 级的成本，所以这里禁止按空闲时间回收连接，
+		// 只依赖 keepalive ping 检测断链。
+		PoolTimeout:     2 * time.Second,
+		ConnMaxIdleTime: -1, // 永不因空闲回收
+		ConnMaxLifetime: 0,  // 永不过期
 	}
 	if socks5Addr != "" {
 		dialer, err := proxy.SOCKS5("tcp", socks5Addr, nil, proxy.Direct)

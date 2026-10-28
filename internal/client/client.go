@@ -255,49 +255,70 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 	c.register(req.ID, ch)
 	defer c.unregister(req.ID)
 
-	// Fire the XADD and do not wait for its round-trip confirmation: the
-	// server only needs the message to land in the stream, and the blocking
-	// XRead below delivers the answer as soon as it is ready. Skipping the
-	// confirmation round-trip saves one full RTT on every cold query.
-	xaddErr := make(chan error, 1)
+	// Fire the PUBLISH and do not wait for its confirmation: the response is
+	// pushed to the dispatcher's subscription the instant the server publishes
+	// it. Skipping the confirmation round-trip saves one full RTT.
+	pubErr := make(chan error, 1)
 	go func() {
 		started := time.Now()
-		err := c.rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: redisx.StreamRequests,
-			Values: map[string]interface{}{"data": string(payload)},
-		}).Err()
-		log.Printf("client: xadd-ack id=%s confirm_after_start=%.1fms", shortID(req.ID), float64(time.Since(started).Microseconds())/1000)
-		xaddErr <- err
+		err := c.rdb.Publish(ctx, redisx.ChannelRequests, payload).Err()
+		log.Printf("client: pub-req id=%s confirm_after_start=%.1fms", shortID(req.ID), float64(time.Since(started).Microseconds())/1000)
+		pubErr <- err
 	}()
 
-	select {
-	case resp := <-ch:
-		if resp.Err != "" {
-			return resp, errors.New(resp.Err)
+	// pub/sub 推送偶发丢失（跨公网链路抖动时 PUBLISH 确认延迟、订阅
+	// 连接闪断），在 block_time 内重发一次请求即可恢复——服务端
+	// cache-first，重发命中的是缓存，幂等且便宜。
+	deadline := time.Now().Add(c.block)
+	for attempt := 0; ; attempt++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return proto.Response{}, errors.New("resolution timed out")
 		}
-		return resp, nil
-	case err := <-xaddErr:
-		// The XADD confirmation only means the request landed in the stream —
-		// the response is still on its way. Only a real XADD failure aborts.
-		if err != nil {
-			return proto.Response{}, err
-		}
-		// Confirmation received, keep waiting for the response below.
+		waitCtx, cancel := context.WithTimeout(ctx, remaining)
+		pubErr := make(chan error, 1)
+		go func() {
+			started := time.Now()
+			err := c.rdb.Publish(waitCtx, redisx.ChannelRequests, payload).Err()
+			log.Printf("client: pub-req id=%s attempt=%d confirm_after_start=%.1fms",
+				shortID(req.ID), attempt, float64(time.Since(started).Microseconds())/1000)
+			pubErr <- err
+		}()
 		select {
 		case resp := <-ch:
+			cancel()
 			if resp.Err != "" {
 				return resp, errors.New(resp.Err)
 			}
 			return resp, nil
-		case <-time.After(c.block):
-			return proto.Response{}, errors.New("resolution timed out")
+		case err := <-pubErr:
+			if err != nil {
+				cancel()
+				// 发布失败：若还有时间则重试，否则放弃
+				continue
+			}
+			// 已发布；在剩余时间内等推送
+			select {
+			case resp := <-ch:
+				cancel()
+				if resp.Err != "" {
+					return resp, errors.New(resp.Err)
+				}
+				return resp, nil
+			case <-time.After(remaining / 2):
+				cancel()
+				// 一半时间没响应：回到循环顶重发（attempt+1）
+			case <-ctx.Done():
+				cancel()
+				return proto.Response{}, ctx.Err()
+			}
+		case <-time.After(remaining / 2):
+			cancel()
+			// 确认和响应都没等到（连接慢）：重发
 		case <-ctx.Done():
+			cancel()
 			return proto.Response{}, ctx.Err()
 		}
-	case <-time.After(c.block):
-		return proto.Response{}, errors.New("resolution timed out")
-	case <-ctx.Done():
-		return proto.Response{}, ctx.Err()
 	}
 }
 
@@ -306,73 +327,39 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 // requests, so the Redis connection pool is not exhausted by per-request
 // blocking reads.
 func (c *Client) runDispatcher(ctx context.Context) {
-	lastID := "$"
 	backoff := time.Second
 	for ctx.Err() == nil {
-		// 阻塞等第一批响应。Block 5s（而不是 0）：
-		// go-redis 对 Block=0 会设置 readTimeout=0（无限期）且 Redis 端
-		// BLOCK 0 同样无限期；使用有限 BLOCK 让连接在空闲时定期归还池，
-		// 也让 ctx 取消能及时生效。
-		streams, err := c.rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{redisx.StreamResponses, lastID},
-			Count:   100,
-			Block:   5 * time.Second,
-		}).Result()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+		func() {
+			// 响应经 PUBLISH 即时推送，无需轮询；一个订阅连接服务所有请求。
+			pubsub := c.rdb.Subscribe(ctx, redisx.ChannelResponses)
+			defer pubsub.Close()
+			ch := pubsub.Channel()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case msg, ok := <-ch:
+					if !ok {
+						return
+					}
+					var resp proto.Response
+					if err := json.Unmarshal([]byte(msg.Payload), &resp); err != nil {
+						continue
+					}
+					log.Printf("client: resp-recv id=%s", shortID(resp.ID))
+					c.dispatch(resp)
+				}
 			}
-			if errors.Is(err, redis.Nil) {
-				continue
-			}
-			log.Printf("client: xread responses: %v (retry in %s)", err, backoff)
-			time.Sleep(backoff)
-			if backoff < 5*time.Second {
-				backoff *= 2
-			}
-			continue
+		}()
+		if ctx.Err() != nil {
+			return
 		}
-		backoff = time.Second
-		n := c.dispatchBatch(streams, &lastID)
-
-		// 关键：并发一批响应几乎同时写进流，BLOCK 唤醒只保证读到其中
-		// 一部分（先到的）。立刻用非阻塞 XREAD 把积压读空，否则剩下的
-		// 响应要等下一轮 BLOCK 唤醒，在公网链路上白付一个 RTT。
-		for n > 0 {
-			streams, err = c.rdb.XRead(ctx, &redis.XReadArgs{
-				Streams: []string{redisx.StreamResponses, lastID},
-				Count:   100,
-				Block:   -1, // 非阻塞：go-redis 不加 BLOCK 参数
-			}).Result()
-			if err != nil {
-				break // redis.Nil = 读尽
-			}
-			n = c.dispatchBatch(streams, &lastID)
+		log.Printf("client: dispatcher pubsub disconnected (retry in %s)", backoff)
+		time.Sleep(backoff)
+		if backoff < 5*time.Second {
+			backoff *= 2
 		}
 	}
-}
-
-// dispatchBatch dispatches messages from one XREAD result and updates lastID.
-// Returns the number of messages read.
-func (c *Client) dispatchBatch(streams []redis.XStream, lastID *string) int {
-	n := 0
-	for _, st := range streams {
-		for _, msg := range st.Messages {
-			*lastID = msg.ID
-			n++
-			data, ok := msg.Values["data"].(string)
-			if !ok {
-				continue
-			}
-			var resp proto.Response
-			if err := json.Unmarshal([]byte(data), &resp); err != nil {
-				continue
-			}
-			log.Printf("client: resp-recv id=%s", shortID(resp.ID))
-			c.dispatch(resp)
-		}
-	}
-	return n
 }
 
 // runSubscriber subscribes to the updates channel and warms the local cache
@@ -421,8 +408,16 @@ func (c *Client) dispatch(resp proto.Response) {
 	c.wmu.Lock()
 	ch, ok := c.waits[resp.ID]
 	c.wmu.Unlock()
-	if ok {
-		ch <- resp
+	if !ok {
+		return // 迟到的响应：等待者已超时离开
+	}
+	// 非阻塞发送：waits 的 channel 容量为1且等待者必然在 select 消费，
+	// 这里若满说明是重复投递（pubsub 广播/重连重放），直接丢弃。
+	// 绝不能阻塞 dispatcher——否则 pubsub 缓冲堆积、消息开始被丢弃，
+	// 所有后续查询都会超时（实测踩过：channel full for 1m0s）。
+	select {
+	case ch <- resp:
+	default:
 	}
 }
 

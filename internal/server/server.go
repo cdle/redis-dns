@@ -9,8 +9,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
 	"strconv"
 	"strings"
@@ -40,6 +38,7 @@ type Server struct {
 	halfLife time.Duration                                     // query-count decay half-life
 	rank     rankStore                                         // query-count ranking storage
 	countCh  chan string                                       // query-count queue feeding runCounter
+	jobs     chan string                                       // request payloads for the worker pool
 	resolve  func(name string, qtype uint16) (*dns.Msg, error) // prefetch resolve path
 }
 
@@ -65,16 +64,14 @@ func New(rdb *redis.Client, res *resolver.Resolver, group, consumer string, cach
 		halfLife: halfLife,
 		rank:     &redisRankStore{rdb: rdb},
 		countCh:  make(chan string, countQueueSize),
+		jobs:     make(chan string, 256),
 		resolve:  res.Resolve,
 	}
 }
 
 // Run blocks, processing requests until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	if err := s.ensureGroup(ctx); err != nil {
-		return err
-	}
-	log.Printf("server: consuming stream %q as group %q with %d workers", redisx.StreamRequests, s.group, s.workers)
+	log.Printf("server: subscribing %q with %d workers", redisx.ChannelRequests, s.workers)
 
 	go s.runCounter(ctx)
 	if s.prefetch > 0 {
@@ -82,11 +79,25 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
+	// 订阅者（单一）：接收 pub/sub，分发到 jobs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.worker(ctx, s.consumer)
+	}()
+	// 处理者池：并发 resolve
 	for i := 0; i < s.workers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			s.worker(ctx, fmt.Sprintf("%s-%d", s.consumer, i))
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case payload := <-s.jobs:
+					s.handlePayload(ctx, payload)
+				}
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -95,78 +106,54 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) worker(ctx context.Context, consumer string) {
 	backoff := time.Second
-	for {
+	for ctx.Err() == nil {
+		func() {
+			// 单一订阅连接：Redis pub/sub 是广播，如果每个 worker 都
+			// SUBSCRIBE，同一条请求会被处理 N 次。所以只有这个 goroutine
+			// 订阅，收到后交给共享任务池（s.jobs）并发处理。
+			pubsub := s.rdb.Subscribe(ctx, redisx.ChannelRequests)
+			defer pubsub.Close()
+			ch := pubsub.Channel(redis.WithChannelSize(256))
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.jobs:
+					// drain signal（不应发生）
+				case msg, ok := <-ch:
+					if !ok {
+						return // 连接断开，外层重连
+					}
+					select {
+					case s.jobs <- msg.Payload:
+					default:
+						log.Printf("server: job queue full, dropping request")
+					}
+				}
+			}
+		}()
 		if ctx.Err() != nil {
 			return
 		}
-
-		streams, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    s.group,
-			Consumer: consumer,
-			Streams:  []string{redisx.StreamRequests, ">"},
-			Count:    16,
-			Block:    30 * time.Second,
-		}).Result()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if errors.Is(err, redis.Nil) {
-				continue
-			}
-			log.Printf("server: xreadgroup: %v (retry in %s)", err, backoff)
-			if strings.Contains(err.Error(), "NOGROUP") {
-				// Consumer group vanished (e.g. redis restarted without
-				// persistence): recreate it instead of spinning forever.
-				if gerr := s.ensureGroup(ctx); gerr != nil {
-					log.Printf("server: ensureGroup after NOGROUP: %v", gerr)
-				} else {
-					log.Printf("server: group recreated after NOGROUP")
-				}
-			}
-			time.Sleep(backoff)
-			if backoff < 5*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		backoff = time.Second
-
-		for _, stream := range streams {
-			for _, msg := range stream.Messages {
-				// Process concurrently: a slow upstream resolve must not
-				// block the pickup of the other messages in this batch.
-				go func(m redis.XMessage) {
-					s.handle(ctx, m)
-					// Ack regardless so malformed messages never loop forever.
-					s.rdb.XAck(ctx, redisx.StreamRequests, s.group, m.ID)
-				}(msg)
-			}
+		log.Printf("server: %s pubsub disconnected (retry in %s)", consumer, backoff)
+		time.Sleep(backoff)
+		if backoff < 5*time.Second {
+			backoff *= 2
 		}
 	}
 }
 
-func (s *Server) ensureGroup(ctx context.Context) error {
-	err := s.rdb.XGroupCreateMkStream(ctx, redisx.StreamRequests, s.group, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return err
-	}
-	return nil
-}
-
-func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
-	data, ok := msg.Values["data"].(string)
-	if !ok {
-		log.Printf("server: message %s missing data field", msg.ID)
-		return
-	}
-
+// handlePayload parses one request payload and resolves it.
+func (s *Server) handlePayload(ctx context.Context, data string) {
 	var req proto.Request
 	if err := json.Unmarshal([]byte(data), &req); err != nil {
 		log.Printf("server: malformed request: %v", err)
 		return
 	}
+	s.handle(ctx, req)
+}
 
+func (s *Server) handle(ctx context.Context, req proto.Request) {
 	s.countQuery(ctx, req.Name, req.Type)
 
 	start := time.Now()
@@ -185,12 +172,7 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 		resp.ResolvedAt = time.Now().UnixNano()
 		log.Printf("server: cache-hit name=%s type=%d took=%s", req.Name, req.Type, time.Since(start))
 		payload, _ := json.Marshal(resp)
-		s.rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: redisx.StreamResponses,
-			MaxLen: s.respMax,
-			Approx: true,
-			Values: map[string]interface{}{"data": string(payload)},
-		})
+		s.rdb.Publish(ctx, redisx.ChannelResponses, payload)
 		return
 	}
 
@@ -214,17 +196,11 @@ func (s *Server) handle(ctx context.Context, msg redis.XMessage) {
 	}
 
 	payload, _ := json.Marshal(resp)
-	// Fire-and-forget: the message is effective the instant it lands in the
-	// stream; waiting for the XADD confirmation round-trip only delays the
-	// worker from picking up the next request.
+	// Fire-and-forget PUBLISH: push semantics deliver the response to every
+	// subscriber immediately; no confirmation round-trip on the hot path.
 	go func() {
-		if err := s.rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: redisx.StreamResponses,
-			MaxLen: s.respMax,
-			Approx: true,
-			Values: map[string]interface{}{"data": string(payload)},
-		}).Err(); err != nil {
-			log.Printf("server: xadd response: %v", err)
+		if err := s.rdb.Publish(ctx, redisx.ChannelResponses, payload).Err(); err != nil {
+			log.Printf("server: publish response: %v", err)
 		}
 	}()
 }
