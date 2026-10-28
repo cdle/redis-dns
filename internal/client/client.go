@@ -78,6 +78,9 @@ func (c *Client) SetBackup(rdb *redis.Client) { c.rdb2 = rdb }
 // response dispatcher and update subscriber, until ctx is cancelled.
 func (c *Client) ListenAndServe(ctx context.Context, addr, dohAddr string) error {
 	go c.runDispatcher(ctx)
+	if c.rdb2 != nil {
+		go c.runDispatcherOn(c.rdb2, "bk")
+	}
 	go c.runSubscriber(ctx)
 
 	if dohAddr != "" {
@@ -355,11 +358,18 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 // requests, so the Redis connection pool is not exhausted by per-request
 // blocking reads.
 func (c *Client) runDispatcher(ctx context.Context) {
+	c.runDispatcherOn(c.rdb, "main")
+}
+
+// runDispatcherOn 同上，但跑在指定线路上：主备各挂一个响应订阅，
+// 推送走哪条线先到算哪条——单线路推送丢失时另一条 ~1 RTT 补上。
+func (c *Client) runDispatcherOn(cli *redis.Client, tag string) {
+	ctx := context.Background()
 	backoff := time.Second
-	for ctx.Err() == nil {
+	for {
 		func() {
 			// 响应经 PUBLISH 即时推送，无需轮询；一个订阅连接服务所有请求。
-			pubsub := c.rdb.Subscribe(ctx, redisx.ChannelResponses)
+			pubsub := cli.Subscribe(ctx, redisx.ChannelResponses)
 			defer pubsub.Close()
 			ch := pubsub.Channel()
 			for {
@@ -374,7 +384,7 @@ func (c *Client) runDispatcher(ctx context.Context) {
 					if err := json.Unmarshal([]byte(msg.Payload), &resp); err != nil {
 						continue
 					}
-					log.Printf("client: resp-recv id=%s", shortID(resp.ID))
+					log.Printf("client: resp-recv id=%s/%s", shortID(resp.ID), tag)
 					c.dispatch(resp)
 				}
 			}
