@@ -255,35 +255,44 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 	c.register(req.ID, ch)
 	defer c.unregister(req.ID)
 
-	// Fire the PUBLISH and do not wait for its confirmation: the response is
-	// pushed to the dispatcher's subscription the instant the server publishes
-	// it. Skipping the confirmation round-trip saves one full RTT.
-	pubErr := make(chan error, 1)
-	go func() {
-		started := time.Now()
-		err := c.rdb.Publish(ctx, redisx.ChannelRequests, payload).Err()
-		log.Printf("client: pub-req id=%s confirm_after_start=%.1fms", shortID(req.ID), float64(time.Since(started).Microseconds())/1000)
-		pubErr <- err
-	}()
-
-	// pub/sub 推送偶发丢失（跨公网链路抖动时 PUBLISH 确认延迟、订阅
-	// 连接闪断），在 block_time 内重发一次请求即可恢复——服务端
-	// cache-first，重发命中的是缓存，幂等且便宜。
+	// PUBLISH 立即发出（循环内 attempt=0），不等确认：响应推送与确认走
+	// 不同连接，响应常常先于确认到达。pub/sub 推送偶发丢失（跨公网链路
+	// 抖动、订阅闪断），在 block_time 内重发即可恢复——服务端 cache-first，
+	// 重发命中的是缓存，幂等且便宜。
+	//
+	// 结构：单一 select 同时监听 响应ch / 发布确认 / 重发定时器。
+	// 响应可能在 PUBLISH 确认之前就被 dispatcher 投递，所以 ch 必须始终
+	// 在 select 里，不能在收到确认后切换到嵌套 select（会错过已投递响应，
+	// 这就是并发时一个快、其余慢 1 秒的根因）。（跨公网链路抖动时 PUBLISH 确认延迟、订阅
+	// 连接闪断），在 block_time 内重发请求即可恢复——服务端 cache-first，
+	// 重发命中的是缓存，幂等且便宜。
+	//
+	// 结构：单一 select 同时监听 响应ch / 发布确认 / 重发定时器。
+	// 响应可能在 PUBLISH 确认之前就被 dispatcher 投递（响应推送与确认
+	// 走不同连接，存在竞态），所以 ch 必须始终在 select 里。
 	deadline := time.Now().Add(c.block)
-	for attempt := 0; ; attempt++ {
+	attempt := 0
+	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return proto.Response{}, errors.New("resolution timed out")
 		}
-		waitCtx, cancel := context.WithTimeout(ctx, remaining)
+		// 重发节奏：首发后 400ms（约2个RTT）未确认即重发；确认后 300ms
+		// 未收到推送再重发。快速幂等重试把 TCP 重传长尾压到一个额外 RTT。
+		nextFire := 300 * time.Millisecond
+		if attempt == 0 {
+			nextFire = 400 * time.Millisecond
+		}
 		pubErr := make(chan error, 1)
-		go func() {
+		pubCtx, cancel := context.WithTimeout(ctx, remaining)
+		go func(attempt int) {
 			started := time.Now()
-			err := c.rdb.Publish(waitCtx, redisx.ChannelRequests, payload).Err()
-			log.Printf("client: pub-req id=%s attempt=%d confirm_after_start=%.1fms",
-				shortID(req.ID), attempt, float64(time.Since(started).Microseconds())/1000)
+			err := c.rdb.Publish(pubCtx, redisx.ChannelRequests, payload).Err()
+			log.Printf("client: pub-req id=%s attempt=%d confirm_after_start=%.1fms err=%v",
+				shortID(req.ID), attempt, float64(time.Since(started).Microseconds())/1000, err != nil && err != context.DeadlineExceeded)
 			pubErr <- err
-		}()
+			cancel()
+		}(attempt)
 		select {
 		case resp := <-ch:
 			cancel()
@@ -292,31 +301,30 @@ func (c *Client) resolve(ctx context.Context, name string, qtype uint16) (proto.
 			}
 			return resp, nil
 		case err := <-pubErr:
-			if err != nil {
-				cancel()
-				// 发布失败：若还有时间则重试，否则放弃
-				continue
+			cancel()
+			if err != nil && attempt >= 2 {
+				return proto.Response{}, err
 			}
-			// 已发布；在剩余时间内等推送
+			// 确认到了：等推送。300ms（约1.5个RTT）没到就重发——
+			// 服务端 cache-first，重发幂等且便宜；快速重发把 TCP 重传
+			// 造成的长尾从 3s 压到一个额外 RTT。
 			select {
 			case resp := <-ch:
-				cancel()
 				if resp.Err != "" {
 					return resp, errors.New(resp.Err)
 				}
 				return resp, nil
-			case <-time.After(remaining / 2):
-				cancel()
-				// 一半时间没响应：回到循环顶重发（attempt+1）
+			case <-time.After(300 * time.Millisecond):
+				attempt++
+				continue
 			case <-ctx.Done():
-				cancel()
 				return proto.Response{}, ctx.Err()
 			}
-		case <-time.After(remaining / 2):
-			cancel()
-			// 确认和响应都没等到（连接慢）：重发
+		case <-time.After(nextFire):
+			// 确认和响应都没等到：重发
+			attempt++
+			continue
 		case <-ctx.Done():
-			cancel()
 			return proto.Response{}, ctx.Err()
 		}
 	}
